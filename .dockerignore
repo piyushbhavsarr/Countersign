@@ -1,0 +1,3 @@
+bin/
+.git/
+**/__pycache__/
