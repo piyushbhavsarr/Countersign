@@ -1,0 +1,299 @@
+# Undolayer default policy.
+#
+# Every rule can only escalate (allow < hold < require_approval < deny); the most severe
+# match wins. Rules match *facts measured or reported by the system itself* - SQLite's
+# authorizer and row capture, the filesystem diff, the registry's declared lanes, the
+# cloud's own permission checks - never patterns over command or query text.
+#
+# Lanes by default (no rule needed):
+#   read, reversible, compensable -> run now      deferrable -> held until commit
+#   irreversible                  -> human approval, then runs on commit
+
+[settings]
+hold_irreversible = true
+require_approval_for_commit = false   # true: every commit needs a human (recommended for prod)
+redact_results = true                 # sensitive values never reach the agent
+sensitive_min_len = 8                 # shortest token treated as a secret value
+lineage_min_len = 4                   # shortest value used to link a step to an earlier one
+
+[budget]
+max_rows_changed = 1000
+max_table_fraction_changed = 0.5      # deleting/overwriting over half of any table (>= 20 rows)
+max_files_deleted = 50
+max_external_effects = 25
+max_spend_cents = 100000
+max_kube_objects_deleted = 10         # Kubernetes objects deleted in one task
+max_kube_objects_changed = 50
+
+# ---------------------------------------------------------------- SQL (facts from SQLite itself)
+[[rule]]
+id = "sql-transaction-control"
+connector = "sql"
+when = { transaction_control = true }
+decision = "deny"
+reason = "BEGIN/COMMIT/ROLLBACK/SAVEPOINT are managed by the runtime; issuing them would escape staging"
+
+[[rule]]
+id = "sql-attach"
+connector = "sql"
+when = { attach = true }
+decision = "deny"
+reason = "ATTACH would let statements write to a database the runtime is not capturing"
+
+[[rule]]
+id = "sql-pragma-set"
+connector = "sql"
+when = { pragma_set = { exists = true, ne = [] } }
+decision = "deny"
+reason = "PRAGMA assignments change engine behaviour (foreign keys, triggers, journaling); read pragmas via pragma_<name>() functions"
+
+[[rule]]
+id = "sql-destroys-schema"
+connector = "sql"
+when = { destroys_schema = true }
+decision = "deny"
+reason = "Dropping tables or columns destroys data (Replit/SaaStr class incident)"
+
+[[rule]]
+id = "sql-renames-schema"
+connector = "sql"
+when = { renames_schema = true }
+decision = "require_approval"
+reason = "Renaming a table breaks every reader of the old name"
+
+[[rule]]
+id = "sql-large-write"
+connector = "sql"
+when = { rows_affected = { gt = 100 } }
+decision = "require_approval"
+reason = "Statement changed more than 100 rows (counted by the database, cascades included)"
+
+[[rule]]
+id = "sql-not-undoable"
+connector = "sql"
+when = { undoable = false }
+decision = "require_approval"
+reason = "Statement writes a table whose changes cannot be captured (virtual table), so it cannot be undone"
+
+# ---------------------------------------------------------------- Filesystem / shell
+[[rule]]
+id = "fs-outside-workspace"
+connector = "fs"
+when = { outside_workspace = true }
+decision = "deny"
+reason = "Path resolves outside the workspace"
+
+[[rule]]
+id = "shell-unsandboxed"
+connector = "shell"
+when = { sandboxed = false }
+decision = "require_approval"
+reason = "The operator disabled the OS sandbox, so this command is not confined"
+
+# ---------------------------------------------------------------- Git
+[[rule]]
+id = "git-force-push"
+connector = "git"
+when = { force = true }
+decision = "deny"
+reason = "Force push rewrites shared history"
+
+[[rule]]
+id = "git-protected-branch"
+connector = "git"
+operation = "push"
+when = { protected = true }
+decision = "require_approval"
+reason = "Push to a protected branch"
+
+# ---------------------------------------------------------------- Data leaving the box
+[[rule]]
+id = "egress-sensitive"
+when = { egress = true, contains_sensitive = true }
+decision = "deny"
+reason = "Sends sensitive data off the box (a delegated credential or a value from a VCS-ignored file)"
+
+[[rule]]
+id = "egress-scanner-flagged"
+when = { egress = true, contains_flagged = true }
+decision = "require_approval"
+reason = "A secret scanner (gitleaks) flags what this would send; a human must confirm it is not a secret"
+
+[[rule]]
+id = "http-agent-headers"
+connector = "http"
+when = { agent_headers = { exists = true, ne = [] } }
+decision = "deny"
+reason = "The agent may not set its own headers (credentials are injected by the gateway)"
+
+[[rule]]
+id = "http-undeclared-host"
+connector = "http"
+when = { host_allowed = false }
+decision = "deny"
+reason = "Host is not covered by any delegated credential or allow-list"
+
+# ---------------------------------------------------------------- Messaging
+[[rule]]
+id = "effect-large-audience"
+when = { audience = { gt = 20 } }
+decision = "require_approval"
+reason = "Message reaches more than 20 people"
+
+[[rule]]
+id = "effect-unknown-audience"
+when = { audience_known = false }
+decision = "require_approval"
+reason = "Audience size of this destination is unknown"
+
+[[rule]]
+id = "effect-external-webhook"
+connector = "effect"
+operation = "webhook"
+when = { external_destination = true }
+decision = "require_approval"
+reason = "Webhook to a destination the operator has not declared"
+
+[[rule]]
+id = "egress-bulk-database"
+when = { egress = true, egress_db_bytes = { gt = 512 } }
+decision = "require_approval"
+reason = "Would carry more than 512 bytes of production query results off the box"
+
+[[rule]]
+id = "egress-repeated"
+when = { egress = true, repeats = { gte = 2 } }
+decision = "require_approval"
+reason = "The same side effect issued three or more times (retry storm or duplicate send)"
+
+[[rule]]
+id = "effect-external-many"
+connector = "effect"
+operation = "email"
+when = { external_recipients = { gt = 3 } }
+decision = "require_approval"
+reason = "Email to more than 3 people outside the organisation"
+
+[[rule]]
+id = "egress-workspace-content"
+when = { egress = true, egress_workspace_bytes = { gt = 512 } }
+decision = "require_approval"
+reason = "Would carry more than 512 bytes of workspace content (source, configuration) off the box"
+
+# ---------------------------------------------------------------- Cloud
+[[rule]]
+id = "cloud-plan-destroys"
+connector = "cloud"
+when = { destroy_count = { gt = 0 } }
+decision = "require_approval"
+reason = "Terraform plan deletes or replaces resources"
+
+[[rule]]
+id = "cloud-apply-without-plan"
+connector = "cloud"
+operation = "terraform_apply"
+when = { has_plan = false }
+decision = "deny"
+reason = "terraform_apply needs a saved plan from terraform_plan in the same transaction"
+
+# ---------------------------------------------------------------- Registry tools
+[[rule]]
+id = "registry-high-risk"
+when = { risk = "high", lane = ["irreversible"] }
+decision = "require_approval"
+reason = "High-risk irreversible action"
+
+[[rule]]
+id = "registry-undeclared-args"
+when = { unknown_args = { exists = true, ne = [] }, tool = { exists = true } }
+decision = "deny"
+reason = "Argument not declared by the registry entry for this action"
+
+# ---------------------------------------------------------------- PostgreSQL (facts from the parse tree and catalog)
+[[rule]]
+id = "sql-privilege-change"
+connector = "sql"
+when = { privilege_change = true }
+decision = "deny"
+reason = "Agents may not grant, revoke or alter roles and ownership"
+
+[[rule]]
+id = "sql-copy-external"
+connector = "sql"
+when = { copy_external = true }
+decision = "deny"
+reason = "COPY to/from a program or server file reaches outside the database"
+
+[[rule]]
+id = "sql-opaque-code"
+connector = "sql"
+when = { opaque_code = true }
+decision = "require_approval"
+reason = "DO/CALL blocks, triggers, rules and user-defined functions can do anything; a human must review them"
+
+[[rule]]
+id = "sql-unknown-statement"
+connector = "sql"
+when = { unknown_statement = true }
+decision = "require_approval"
+reason = "Statement type the runtime does not model"
+
+[[rule]]
+id = "sql-schema-unsupported"
+connector = "sql"
+when = { schema_unsupported = true }
+decision = "require_approval"
+reason = "Schema change the runtime cannot invert (only additive DDL is undoable)"
+
+[[rule]]
+id = "sql-wrote-despite-read"
+connector = "sql"
+when = { wrote_despite_read = true }
+decision = "require_approval"
+reason = "A read-only statement changed data (through a function)"
+
+# ---------------------------------------------------------------- Confused deputy
+[[rule]]
+id = "destination-not-requested"
+when = { destination_untrusted = true }
+decision = "require_approval"
+reason = "Destination (recipient, URL, account, venue) does not appear in the user's request; it came from data the agent read"
+
+[[rule]]
+id = "content-address-not-requested"
+when = { egress = true, content_untrusted_addresses = { exists = true } }
+decision = "require_approval"
+reason = "Message carries a link or address that came from data the agent read, not from the user's request"
+
+# ---------------------------------------------------------------- Kubernetes (facts from the API server)
+# Deletes that destroy stored data are irreversible (approval) from the cluster's own
+# reclaim and retention policies; everything else is validated by a server dry run,
+# applied on commit and undoable.
+
+[[rule]]
+id = "kube-destroys-data"
+connector = "kube"
+when = { destroys_data = true }
+decision = "require_approval"
+reason = "Deleting this destroys stored data: the volume's reclaim policy (or the StatefulSet's claim retention) is Delete"
+
+[[rule]]
+id = "kube-scale-to-zero"
+connector = "kube"
+when = { scales_to_zero = true }
+decision = "require_approval"
+reason = "Scaling a running workload to zero replicas takes it offline"
+
+[[rule]]
+id = "kube-large-cascade"
+connector = "kube"
+when = { cascade_count = { gt = 20 } }
+decision = "require_approval"
+reason = "This delete takes more than 20 objects with it"
+
+[[rule]]
+id = "kube-permissions"
+connector = "kube"
+when = { grants_permissions = true }
+decision = "require_approval"
+reason = "Creating or changing RBAC objects grants or removes permissions in the cluster"
