@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "undolayer"
+version = "0.3.0"
+description = "Put your AI agent's tools behind the undolayer gateway: preview, approve, commit or undo every action"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3"]
