@@ -1,0 +1,70 @@
+[tool]
+name = "crm"
+base_url = "http://127.0.0.1:0"     # replaced by the test server's address
+credential = "crm"
+
+[action.get_deal]
+kind = "read"
+description = "Read a deal"
+request = { method = "GET", path = "/deals/{args.id}" }
+params = { id = { type = "integer" } }
+required = ["id"]
+
+[action.update_deal]
+kind = "reversible"
+description = "Change a deal's stage or owner"
+request = { method = "PATCH", path = "/deals/{args.id}", body = "$args" }
+params = { id = { type = "integer" }, stage = { type = "string" }, owner = { type = "string" } }
+required = ["id"]
+capture_before = { call = "get_deal", args = { id = "$args.id" } }
+undo = { call = "update_deal", args = { id = "$args.id", stage = "$before.stage", owner = "$before.owner" } }
+compare = ["stage", "owner"]
+risk = "medium"
+test = { args = { id = 88, stage = "Lost" }, state = { call = "get_deal", args = { id = 88 } } }
+
+[action.create_deal]
+kind = "compensable"
+description = "Create a deal"
+request = { method = "POST", path = "/deals", body = "$args" }
+params = { stage = { type = "string" }, amount = { type = "integer" } }
+undo = { call = "delete_deal", args = { id = "$response.id" } }
+
+[action.delete_deal]
+kind = "irreversible"
+description = "Delete a deal permanently"
+request = { method = "DELETE", path = "/deals/{args.id}" }
+params = { id = { type = "integer" } }
+required = ["id"]
+
+[action.add_note]
+kind = "deferrable"
+description = "Post a note to the deal timeline (visible to the customer)"
+request = { method = "POST", path = "/notes", body = "$args" }
+params = { deal = { type = "integer" }, text = { type = "string" } }
+delay = "60s"
+side_effects = ["customer notification"]
+
+[action.charge]
+kind = "compensable"
+description = "Charge the customer"
+request = { method = "POST", path = "/charges", body = "$args" }
+params = { amount = { type = "integer" } }
+undo = { call = "refund", args = { id = "$response.id" } }
+lookup = { call = "get_charge_by_key", args = { key = "$step.key" } }
+undo_window = "30d"
+side_effects = ["customer_email_receipt"]
+risk = "high"
+test = { args = { amount = 500 }, state = { call = "balance", args = {} } }
+
+[action.refund]
+kind = "irreversible"
+request = { method = "POST", path = "/charges/{args.id}/refund", body = {} }
+params = { id = { type = "string" } }
+
+[action.get_charge_by_key]
+kind = "read"
+request = { method = "GET", path = "/charges/by-key/{args.key}" }
+
+[action.balance]
+kind = "read"
+request = { method = "GET", path = "/balance" }
