@@ -1,0 +1,44 @@
+# Slack Web API. Unverified until `undolayer registry test registry/slack.toml` passes
+# against a sandbox workspace (it then records the entry hashes in verified.json).
+[tool]
+name = "slack"
+base_url = "https://slack.com/api"
+credential = "slack"            # bot token, scoped to slack.com
+success_field = "ok"            # Slack reports errors as HTTP 200 + {"ok": false}
+
+[action.post_message]
+kind = "deferrable"             # sending is the moment information leaks: hold it until commit
+description = "Post a message to a channel"
+request = { method = "POST", path = "/chat.postMessage", body = { channel = "$args.channel", text = "$args.text" } }
+params = { channel = { type = "string" }, text = { type = "string" } }
+required = ["channel", "text"]
+delay = "30s"                   # after commit, 30 s in which undo simply deletes it from the queue
+undo = { call = "delete_message", args = { channel = "$response.channel", ts = "$response.ts" } }
+side_effects = ["members may have read the message or received a notification"]
+audience = { call = "channel_info", args = { channel = "$args.channel" }, field = "channel.num_members" }
+
+[action.update_message]
+kind = "reversible"
+description = "Edit a message the bot posted"
+request = { method = "POST", path = "/chat.update", body = { channel = "$args.channel", ts = "$args.ts", text = "$args.text" } }
+params = { channel = { type = "string" }, ts = { type = "string" }, text = { type = "string" } }
+required = ["channel", "ts", "text"]
+capture_before = { call = "get_message", args = { channel = "$args.channel", ts = "$args.ts" } }
+undo = { call = "update_message", args = { channel = "$args.channel", ts = "$args.ts", text = "$before.messages.0.text" } }
+compare = ["messages.0.text"]
+test = { args = { channel = "C_SANDBOX", ts = "SANDBOX_TS", text = "edited by round trip" }, state = { call = "get_message", args = { channel = "C_SANDBOX", ts = "SANDBOX_TS" } }, ignore = ["response_metadata"] }
+
+[action.delete_message]
+kind = "irreversible"
+request = { method = "POST", path = "/chat.delete", body = { channel = "$args.channel", ts = "$args.ts" } }
+params = { channel = { type = "string" }, ts = { type = "string" } }
+
+[action.get_message]
+kind = "read"
+request = { method = "GET", path = "/conversations.history", query = { channel = "$args.channel", latest = "$args.ts", inclusive = "true", limit = 1 } }
+params = { channel = { type = "string" }, ts = { type = "string" } }
+
+[action.channel_info]
+kind = "read"
+request = { method = "GET", path = "/conversations.info", query = { channel = "$args.channel", include_num_members = "true" } }
+params = { channel = { type = "string" } }

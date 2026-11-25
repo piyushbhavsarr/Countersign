@@ -1,0 +1,34 @@
+# Google Calendar API v3. Unverified until round-trip tested against a sandbox calendar.
+[tool]
+name = "gcal"
+base_url = "https://www.googleapis.com/calendar/v3"
+credential = "gcal"
+
+[action.create_event]
+kind = "compensable"
+description = "Create an event without notifying attendees"
+request = { method = "POST", path = "/calendars/{args.calendar}/events", query = { sendUpdates = "none" }, body = "$args.event" }
+params = { calendar = { type = "string" }, event = { type = "object" } }
+required = ["calendar", "event"]
+undo = { call = "delete_event", args = { calendar = "$args.calendar", id = "$response.id" } }
+
+[action.update_event]
+kind = "reversible"
+description = "Change an event's title, time, place or description"
+request = { method = "PATCH", path = "/calendars/{args.calendar}/events/{args.id}", query = { sendUpdates = "none" }, body = "$args.changes" }
+params = { calendar = { type = "string" }, id = { type = "string" }, changes = { type = "object" } }
+required = ["calendar", "id", "changes"]
+capture_before = { call = "get_event", args = { calendar = "$args.calendar", id = "$args.id" } }
+undo = { call = "update_event", args = { calendar = "$args.calendar", id = "$args.id", changes = { summary = "$before.summary", description = "$before.description", location = "$before.location", start = "$before.start", end = "$before.end" } } }
+compare = ["summary", "description", "location", "start", "end"]
+test = { args = { calendar = "primary", id = "SANDBOX_EVENT_ID", changes = { summary = "round trip" } }, state = { call = "get_event", args = { calendar = "primary", id = "SANDBOX_EVENT_ID" } }, ignore = ["etag", "updated", "sequence"] }
+
+[action.delete_event]
+kind = "irreversible"
+request = { method = "DELETE", path = "/calendars/{args.calendar}/events/{args.id}", query = { sendUpdates = "none" } }
+params = { calendar = { type = "string" }, id = { type = "string" } }
+
+[action.get_event]
+kind = "read"
+request = { method = "GET", path = "/calendars/{args.calendar}/events/{args.id}" }
+params = { calendar = { type = "string" }, id = { type = "string" } }

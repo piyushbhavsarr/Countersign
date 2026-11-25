@@ -1,0 +1,47 @@
+# Gmail API v1. Unverified until round-trip tested against a sandbox mailbox.
+[tool]
+name = "gmail"
+base_url = "https://gmail.googleapis.com/gmail/v1/users/me"
+credential = "gmail"            # OAuth access token, scoped to gmail.googleapis.com
+
+[action.send]
+kind = "deferrable"
+description = "Send an email (raw = base64url RFC 2822 message)"
+request = { method = "POST", path = "/messages/send", body = { raw = "$args.raw" } }
+params = { raw = { type = "string" } }
+required = ["raw"]
+delay = "30s"                   # "undo send": cancelled for free inside this window
+side_effects = ["recipients can read the email once it is delivered; it cannot be unsent"]
+
+[action.create_draft]
+kind = "compensable"
+description = "Create a draft"
+request = { method = "POST", path = "/drafts", body = { message = { raw = "$args.raw" } } }
+params = { raw = { type = "string" } }
+required = ["raw"]
+undo = { call = "delete_draft", args = { id = "$response.id" } }
+
+[action.delete_draft]
+kind = "irreversible"
+request = { method = "DELETE", path = "/drafts/{args.id}" }
+params = { id = { type = "string" } }
+
+[action.trash]
+kind = "compensable"
+description = "Move a message to the trash"
+request = { method = "POST", path = "/messages/{args.id}/trash", body = {} }
+params = { id = { type = "string" } }
+required = ["id"]
+undo = { call = "untrash", args = { id = "$args.id" } }
+undo_window = "30d"             # Gmail empties the trash after 30 days
+test = { args = { id = "SANDBOX_MESSAGE_ID" }, state = { call = "get_labels", args = { id = "SANDBOX_MESSAGE_ID" } } }
+
+[action.untrash]
+kind = "irreversible"
+request = { method = "POST", path = "/messages/{args.id}/untrash", body = {} }
+params = { id = { type = "string" } }
+
+[action.get_labels]
+kind = "read"
+request = { method = "GET", path = "/messages/{args.id}", query = { format = "minimal" } }
+params = { id = { type = "string" } }

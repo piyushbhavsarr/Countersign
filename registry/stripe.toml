@@ -1,0 +1,32 @@
+# Stripe API. Unverified until round-trip tested in test mode.
+[tool]
+name = "stripe"
+base_url = "https://api.stripe.com/v1"
+credential = "stripe"
+encoding = "form"
+
+[action.charge]
+kind = "compensable"
+description = "Create and confirm a PaymentIntent"
+request = { method = "POST", path = "/payment_intents", body = { amount = "$args.amount_cents", currency = "$args.currency", customer = "$args.customer", payment_method = "$args.payment_method", confirm = true, off_session = true } }
+params = { amount_cents = { type = "integer" }, currency = { type = "string" }, customer = { type = "string" }, payment_method = { type = "string" } }
+required = ["amount_cents", "currency", "customer"]
+undo = { call = "refund", args = { payment_intent = "$response.id" } }
+lookup = { replay = true }      # Stripe replays the original response for a repeated Idempotency-Key
+side_effects = ["customer_email_receipt"]
+risk = "high"
+
+[action.refund]
+kind = "irreversible"
+description = "Refund a PaymentIntent"
+request = { method = "POST", path = "/refunds", body = { payment_intent = "$args.payment_intent", amount = "$args.amount_cents" } }
+params = { payment_intent = { type = "string" }, amount_cents = { type = "integer" } }
+required = ["payment_intent"]
+
+[action.payout]
+kind = "irreversible"
+description = "Pay out to the bank account"
+request = { method = "POST", path = "/payouts", body = { amount = "$args.amount_cents", currency = "$args.currency" } }
+params = { amount_cents = { type = "integer" }, currency = { type = "string" } }
+required = ["amount_cents", "currency"]
+risk = "high"
