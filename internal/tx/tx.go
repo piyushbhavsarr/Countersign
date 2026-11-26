@@ -76,8 +76,11 @@ type Tx struct {
 	Outbox        []*OutboxItem
 	Compensations []*CompRecord
 	UndoRecords   []*UndoRecord
-	Steps         []*Step
-	Handles       map[string]any
+	// AppliedUndo keeps every undo record after it was applied: the before-state of an
+	// undone change stays on record (see EvidenceReport).
+	AppliedUndo []*UndoRecord
+	Steps       []*Step
+	Handles     map[string]any
 	// AwaitingCommit is set while Commit waits for a reviewer's decision on the whole preview.
 	AwaitingCommit *CommitRequest
 	// Requester is who asked for the task.
@@ -1101,6 +1104,9 @@ func (t *Tx) undoApplied() []string {
 				err = c.Undo(r.Record)
 			}
 		}
+		if err == nil {
+			t.AppliedUndo = append(t.AppliedUndo, r)
+		}
 		if err != nil {
 			errs = append(errs, err.Error())
 			remaining = append([]*UndoRecord{r}, remaining...)
@@ -1201,6 +1207,7 @@ func (t *Tx) Undo(step string) (*UndoReport, error) {
 			switch {
 			case err == nil:
 				rep.Undone = append(rep.Undone, r.Connector)
+				t.AppliedUndo = append(t.AppliedUndo, r)
 			case errors.As(err, &cc):
 				rep.Conflicts = append(rep.Conflicts, map[string]any{"connector": r.Connector, "reason": err.Error()})
 				remaining = append([]*UndoRecord{r}, remaining...)
@@ -1347,6 +1354,7 @@ type journalForm struct {
 	Outbox        []*OutboxItem              `json:"outbox"`
 	Compensations []*CompRecord              `json:"compensations"`
 	UndoRecords   []*UndoRecord              `json:"undo_records"`
+	AppliedUndo   []*UndoRecord              `json:"applied_undo_records,omitempty"`
 	Steps         []*Step                    `json:"steps"`
 	State2        map[string]json.RawMessage `json:"connector_state"`
 	OwnerPID      int                        `json:"owner_pid,omitempty"`
@@ -1371,7 +1379,7 @@ func (t *Tx) MarshalJSON() ([]byte, error) {
 		st[k] = b
 	}
 	f := journalForm{ID: t.ID, Task: t.Task, State: t.State, Created: t.Created, Actions: t.Actions, Outbox: t.Outbox,
-		Compensations: t.Compensations, UndoRecords: t.UndoRecords, Steps: t.Steps, State2: st, Awaiting: t.AwaitingCommit, Requester: t.Requester,
+		Compensations: t.Compensations, UndoRecords: t.UndoRecords, AppliedUndo: t.AppliedUndo, Steps: t.Steps, State2: st, Awaiting: t.AwaitingCommit, Requester: t.Requester,
 		Committing: t.CommittingConnector}
 	if t.owner != nil {
 		f.OwnerPID, f.Node = os.Getpid(), t.Mgr.Node
@@ -1390,7 +1398,7 @@ func fromJournal(m *Manager, b []byte) (*Tx, error) {
 	}
 	t := newTx(m, f.Task, f.ID)
 	t.State, t.Created, t.Actions, t.Outbox = f.State, f.Created, f.Actions, f.Outbox
-	t.Compensations, t.UndoRecords, t.Steps = f.Compensations, f.UndoRecords, f.Steps
+	t.Compensations, t.UndoRecords, t.AppliedUndo, t.Steps = f.Compensations, f.UndoRecords, f.AppliedUndo, f.Steps
 	t.AwaitingCommit, t.Requester, t.Node, t.CommittingConnector = f.Awaiting, f.Requester, f.Node, f.Committing
 	if f.State2 != nil {
 		t.raw = f.State2

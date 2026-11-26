@@ -7,6 +7,7 @@
 //	undolayer recover | worker [--once] | audit
 //	undolayer registry test|list <path>
 //	undolayer hook claude-code | setup claude-code
+//	undolayer evidence <tx> [--out evidence.json]   everything about a task, as JSON
 //	undolayer risk train [--data examples.jsonl] [--out risk-model.json] | risk explain <tx>
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
@@ -137,6 +138,33 @@ func main() {
 			die(fmt.Errorf("FAIL %s: %v", fs.Arg(1), err))
 		}
 		fmt.Printf("PASS %s: create, update, undo and delete round trip; its changes are now undoable\n", fs.Arg(1))
+		return
+	case "evidence":
+		parseArgs(fs, args)
+		if fs.Arg(0) == "" {
+			die(errors.New("usage: undolayer evidence <tx> [--out evidence.json] -c undolayer.toml"))
+		}
+		_, m := load(*cfgPath)
+		t, err := m.Get(fs.Arg(0))
+		if err != nil {
+			die(err)
+		}
+		rep, err := m.EvidenceReport(t)
+		if err != nil {
+			die(err)
+		}
+		rest := fs.Args()[1:]
+		for i := 0; i+1 < len(rest); i++ {
+			if rest[i] == "--out" {
+				b, _ := json.MarshalIndent(rep, "", "  ")
+				if err := os.WriteFile(rest[i+1], append(b, '\n'), 0o600); err != nil {
+					die(err)
+				}
+				fmt.Printf("evidence for %s written to %s\n", t.ID, rest[i+1])
+				return
+			}
+		}
+		out(rep)
 		return
 	case "risk":
 		parseArgs(fs, args)

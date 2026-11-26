@@ -49,3 +49,44 @@ func (m *Manager) Evidence(id string) ([]map[string]any, error) {
 	})
 	return out, err
 }
+
+// EvidenceReport is everything known about one task, as a single document: what was
+// asked, every action with its facts and decision, what each reviewer approved or declined
+// and exactly what they were shown, the recorded before-state that undo restores, the
+// outbox, the steps that ran, the task's audit events, and whether the audit chain is
+// intact. It is built from what the runtime keeps anyway, so it is available whatever
+// happened to the task: committed, undone, declined or failed.
+func (m *Manager) EvidenceReport(t *Tx) (map[string]any, error) {
+	approvals, err := m.Evidence(t.ID)
+	if err != nil {
+		return nil, err
+	}
+	events := []map[string]any{}
+	err = m.Store.AuditLines(func(line []byte) error {
+		var r map[string]any
+		if json.Unmarshal(line, &r) == nil && r["tx"] == t.ID && r["event"] != evidenceEvent {
+			delete(r, "prev")
+			delete(r, "mac")
+			events = append(events, r)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	intact, detail := m.Audit.Verify()
+	return map[string]any{
+		"tx": t.ID, "task": t.Task, "requester": t.Requester, "state": t.State, "created": t.Created,
+		"actions":      t.Actions,
+		"approvals":    approvals,
+		"undo_records": t.UndoRecords,
+		// before-state already restored by an undo, kept on record
+		"applied_undo_records": t.AppliedUndo,
+		"compensations":        t.Compensations,
+		"outbox":               t.Outbox,
+		"steps":                t.Steps,
+		"events":               events,
+		"audit_chain":          map[string]any{"intact": intact, "detail": detail},
+		"exported_at":          model.Now(),
+	}, nil
+}
