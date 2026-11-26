@@ -1,0 +1,19 @@
+# Lanes for τ-bench's retail and airline tools, from what each does in the real world.
+# read          runs now
+# deferrable    takes effect at commit, no approval (data edits without money movement)
+# irreversible  needs approval: anything that moves money or cancels (refunds, charges,
+#               payment-method changes, cancellations, certificates)
+
+read = [
+  "find_user_id_by_email", "find_user_id_by_name_zip", "get_order_details", "get_product_details",
+  "get_user_details", "list_all_product_types", "calculate", "think", "transfer_to_human_agents",
+  "get_reservation_details", "list_all_airports", "search_direct_flight", "search_onestop_flight",
+]
+deferrable = [
+  "modify_user_address", "modify_pending_order_address", "update_reservation_passengers",
+]
+irreversible = [
+  "cancel_pending_order", "modify_pending_order_items", "modify_pending_order_payment",
+  "return_delivered_order_items", "exchange_delivered_order_items",
+  "book_reservation", "cancel_reservation", "update_reservation_baggages", "update_reservation_flights", "send_certificate",
+]

@@ -1,0 +1,90 @@
+{
+  "env": {
+    "os": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.15.2"
+  },
+  "rows": [
+    {
+      "operation": "API read (registry tool)",
+      "n": 200,
+      "direct": {
+        "median_ms": 8.300412446260452e-05,
+        "p95_ms": 0.000125030055642128
+      },
+      "gateway": {
+        "median_ms": 7.9158334992825985,
+        "p95_ms": 8.765375008806586
+      },
+      "added_median_ms": 7.915750495158136
+    },
+    {
+      "operation": "API send, queued (deferrable)",
+      "n": 200,
+      "direct": {
+        "median_ms": 8.300412446260452e-05,
+        "p95_ms": 8.405186235904694e-05
+      },
+      "gateway": {
+        "median_ms": 25.557209039106965,
+        "p95_ms": 28.024708037264645
+      },
+      "added_median_ms": 25.557126034982502
+    },
+    {
+      "operation": "SQL read",
+      "n": 200,
+      "direct": {
+        "median_ms": 0.003166031092405319,
+        "p95_ms": 0.003999914042651653
+      },
+      "gateway": {
+        "median_ms": 10.749167005997151,
+        "p95_ms": 11.182749993167818
+      },
+      "added_median_ms": 10.746000974904746
+    },
+    {
+      "operation": "SQL write, staged with row capture",
+      "n": 200,
+      "direct": {
+        "median_ms": 0.16872899141162634,
+        "p95_ms": 0.22175000049173832
+      },
+      "gateway": {
+        "median_ms": 19.185146025847644,
+        "p95_ms": 21.18237502872944
+      },
+      "added_median_ms": 19.016417034436017
+    },
+    {
+      "operation": "file write, staged",
+      "n": 200,
+      "direct": {
+        "median_ms": 0.03308343002572656,
+        "p95_ms": 0.0435409601777792
+      },
+      "gateway": {
+        "median_ms": 21.95749949896708,
+        "p95_ms": 23.328833049163222
+      },
+      "added_median_ms": 21.924416068941355
+    },
+    {
+      "operation": "shell command, sandboxed",
+      "n": 20,
+      "direct": {
+        "median_ms": 2.7594584971666336,
+        "p95_ms": 2.968000015243888
+      },
+      "gateway": {
+        "median_ms": 32.906228967476636,
+        "p95_ms": 34.121000091545284
+      },
+      "added_median_ms": 30.146770470310003
+    }
+  ],
+  "commit_ms": 36.90516692586243,
+  "rollback_ms": 24.746584007516503,
+  "rolled_back_actions": 603
+}

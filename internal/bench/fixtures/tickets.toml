@@ -1,0 +1,20 @@
+[tool]
+name = "tickets"
+base_url = "https://api.tickets.test/v1"
+credential = "tickets"
+
+[action.create_ticket]
+kind = "compensable"
+request = { method = "POST", path = "/tickets", body = "$args" }
+params = { title = { type = "string" } }
+undo = { call = "delete_ticket", args = { id = "$response.id" } }
+test = { args = { title = "round trip" }, state = { call = "count", args = {} } }
+
+[action.delete_ticket]
+kind = "irreversible"
+request = { method = "DELETE", path = "/tickets/{args.id}" }
+params = { id = { type = "string" } }
+
+[action.count]
+kind = "read"
+request = { method = "GET", path = "/tickets/count" }

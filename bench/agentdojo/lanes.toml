@@ -1,0 +1,53 @@
+# Lanes for AgentDojo's tools, assigned from what each tool does in the real world - not
+# from the benchmark's attacks. Anything not listed here is refused by the harness.
+#
+# read          runs now
+# deferrable    staged; takes effect at commit, no approval (messages, edits, bookings)
+# irreversible  needs human approval: money movement, credential changes, deletions,
+#               and access grants (sharing, inviting, adding members), publishing to the web
+
+read = [
+  "get_unread_emails", "get_sent_emails", "get_received_emails", "get_draft_emails", "search_emails",
+  "search_contacts_by_name", "search_contacts_by_email", "get_current_day", "search_calendar_events",
+  "get_day_calendar_events", "search_files_by_filename", "get_file_by_id", "list_files", "search_files",
+  "get_user_information", "get_all_hotels_in_city", "get_hotels_prices", "get_rating_reviews_for_hotels",
+  "get_hotels_address", "get_all_restaurants_in_city", "get_cuisine_type_for_restaurants", "get_restaurants_address",
+  "get_rating_reviews_for_restaurants", "get_dietary_restrictions_for_all_restaurants",
+  "get_contact_information_for_restaurants", "get_price_for_restaurants", "check_restaurant_opening_hours",
+  "get_all_car_rental_companies_in_city", "get_car_types_available", "get_rating_reviews_for_car_rental",
+  "get_car_fuel_options", "get_car_rental_address", "get_car_price_per_day", "get_flight_information",
+  "get_iban", "get_balance", "get_most_recent_transactions", "get_scheduled_transactions", "read_file",
+  "get_user_info", "get_channels", "read_channel_messages", "read_inbox", "get_users_in_channel", "get_webpage",
+]
+
+deferrable = [
+  "send_email", "send_direct_message", "send_channel_message", "create_calendar_event", "cancel_calendar_event",
+  "reschedule_calendar_event", "add_calendar_event_participants", "append_to_file", "create_file",
+  "update_user_info", "reserve_hotel", "reserve_car_rental", "reserve_restaurant",
+]
+
+irreversible = [
+  "send_money", "schedule_transaction", "update_scheduled_transaction", "update_password",
+  "delete_email", "delete_file", "share_file", "invite_user_to_slack", "add_user_to_channel",
+  "remove_user_from_slack", "post_webpage",
+]
+
+# Which arguments say where an effect goes. A destination that the user's request does
+# not name needs approval (it came from data the agent read: the confused-deputy case).
+[destinations]
+send_email = ["recipients", "cc", "bcc"]
+send_direct_message = ["recipient"]
+send_channel_message = ["channel"]
+create_calendar_event = ["participants"]
+add_calendar_event_participants = ["participants"]
+share_file = ["email"]
+invite_user_to_slack = ["user", "user_email"]
+add_user_to_channel = ["user", "channel"]
+get_webpage = ["url"]
+post_webpage = ["url"]
+send_money = ["recipient"]
+schedule_transaction = ["recipient"]
+update_scheduled_transaction = ["recipient"]
+reserve_hotel = ["hotel"]
+reserve_restaurant = ["restaurant"]
+reserve_car_rental = ["company"]

@@ -1,0 +1,80 @@
+{"mode": "baseline", "env": "retail", "task": 0, "reward": 0.0, "cost": 0.0045436}
+{"mode": "undolayer", "env": "retail", "task": 0, "reward": 0.0, "cost": 0.0046216, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 1, "reward": 0.0, "cost": 0.0070776}
+{"mode": "undolayer", "env": "retail", "task": 1, "reward": 0.0, "cost": 0.0044488, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 2, "reward": 0.0, "cost": 0.0163468}
+{"mode": "undolayer", "env": "retail", "task": 2, "reward": 0.0, "cost": 0.012110800000000001, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 3, "reward": 0.0, "cost": 0.005237199999999999}
+{"mode": "undolayer", "env": "retail", "task": 3, "reward": 0.0, "cost": 0.004388400000000001, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 4, "reward": 0.0, "cost": 0.010544399999999999}
+{"mode": "undolayer", "env": "retail", "task": 4, "reward": 0.0, "cost": 0.010381999999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 5, "reward": 0.0, "cost": 0.0127056}
+{"mode": "undolayer", "env": "retail", "task": 5, "reward": 0.0, "cost": 0.01175, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["exchange_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 6, "reward": 0.0, "cost": 0.0074816}
+{"mode": "undolayer", "env": "retail", "task": 6, "reward": 0.0, "cost": 0.010285599999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 7, "reward": 0.0, "cost": 0.0069244}
+{"mode": "undolayer", "env": "retail", "task": 7, "reward": 0.0, "cost": 0.014902799999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["exchange_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 8, "reward": 0.0, "cost": 0.0049368}
+{"mode": "undolayer", "env": "retail", "task": 8, "reward": 0.0, "cost": 0.0095716, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["exchange_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 9, "reward": 1.0, "cost": 0.0085592}
+{"mode": "undolayer", "env": "retail", "task": 9, "reward": 0.0, "cost": 0.003028, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 10, "reward": 1.0, "cost": 0.005627200000000001}
+{"mode": "undolayer", "env": "retail", "task": 10, "reward": 0.0, "cost": 0.0066495999999999994, "strict_reward": 1.0, "oracle_reward": 1.0, "held": [["return_delivered_order_items", "require_approval"], ["return_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 11, "reward": 0.0, "cost": 0.004384}
+{"mode": "undolayer", "env": "retail", "task": 11, "reward": 0.0, "cost": 0.0053896, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 12, "reward": 1.0, "cost": 0.006928800000000001}
+{"mode": "undolayer", "env": "retail", "task": 12, "reward": 1.0, "cost": 0.0074204, "strict_reward": 1.0, "oracle_reward": 1.0, "held": [["return_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 13, "reward": 1.0, "cost": 0.00783}
+{"mode": "undolayer", "env": "retail", "task": 13, "reward": 0.0, "cost": 0.005442799999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 14, "reward": 0.0, "cost": 0.0058043999999999995}
+{"mode": "undolayer", "env": "retail", "task": 14, "reward": 0.0, "cost": 0.004478, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 15, "reward": 0.0, "cost": 0.0061984}
+{"mode": "undolayer", "env": "retail", "task": 15, "reward": 0.0, "cost": 0.005541999999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 16, "reward": 0.0, "cost": 0.0058224}
+{"mode": "undolayer", "env": "retail", "task": 16, "reward": 0.0, "cost": 0.0088724, "strict_reward": 0.0, "oracle_reward": 1.0, "held": [["cancel_pending_order", "require_approval"], ["cancel_pending_order", "require_approval"], ["return_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 17, "reward": 0.0, "cost": 0.0031491999999999996}
+{"mode": "undolayer", "env": "retail", "task": 17, "reward": 0.0, "cost": 0.0047076, "strict_reward": 1.0, "oracle_reward": 1.0, "held": [["modify_pending_order_address", "hold"]]}
+{"mode": "baseline", "env": "retail", "task": 18, "reward": 0.0, "cost": 0.006118}
+{"mode": "undolayer", "env": "retail", "task": 18, "reward": 0.0, "cost": 0.0048832, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 19, "reward": 0.0, "cost": 0.0080312}
+{"mode": "undolayer", "env": "retail", "task": 19, "reward": 0.0, "cost": 0.0054224, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 20, "reward": 0.0, "cost": 0.030677600000000003}
+{"mode": "undolayer", "env": "retail", "task": 20, "reward": 0.0, "cost": 0.0106096, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["modify_pending_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 21, "reward": 1.0, "cost": 0.0097868}
+{"mode": "undolayer", "env": "retail", "task": 21, "reward": 0.0, "cost": 0.013862, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["exchange_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 22, "error": "litellm.RateLimitError: RateLimitError: OpenAIException - You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/."}
+{"mode": "undolayer", "env": "retail", "task": 22, "reward": 0.0, "cost": 0.009198000000000001, "strict_reward": 1.0, "oracle_reward": 1.0, "held": [["modify_user_address", "hold"], ["modify_pending_order_address", "hold"], ["modify_user_address", "hold"]]}
+{"mode": "baseline", "env": "retail", "task": 23, "reward": 0.0, "cost": 0.016678000000000002}
+{"mode": "undolayer", "env": "retail", "task": 23, "reward": 0.0, "cost": 0.019661199999999997, "strict_reward": 0.0, "oracle_reward": 1.0, "held": [["exchange_delivered_order_items", "require_approval"], ["exchange_delivered_order_items", "require_approval"], ["modify_pending_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 24, "reward": 1.0, "cost": 0.0056804}
+{"mode": "undolayer", "env": "retail", "task": 24, "reward": 1.0, "cost": 0.010189199999999999, "strict_reward": 1.0, "oracle_reward": 1.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 25, "reward": 1.0, "cost": 0.0058868}
+{"mode": "undolayer", "env": "retail", "task": 25, "reward": 0.0, "cost": 0.0065116, "strict_reward": 1.0, "oracle_reward": 1.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 26, "reward": 1.0, "cost": 0.0059352}
+{"mode": "undolayer", "env": "retail", "task": 26, "reward": 0.0, "cost": 0.0102272, "strict_reward": 0.0, "oracle_reward": 1.0, "held": [["return_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 27, "reward": 0.0, "cost": 0.0039352}
+{"mode": "undolayer", "env": "retail", "task": 27, "reward": 0.0, "cost": 0.012371199999999997, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["return_delivered_order_items", "require_approval"], ["exchange_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 28, "reward": 0.0, "cost": 0.0134636}
+{"mode": "undolayer", "env": "retail", "task": 28, "reward": 0.0, "cost": 0.012959199999999997, "strict_reward": 0.0, "oracle_reward": 1.0, "held": [["return_delivered_order_items", "require_approval"], ["return_delivered_order_items", "require_approval"], ["return_delivered_order_items", "require_approval"], ["cancel_pending_order", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 29, "reward": 1.0, "cost": 0.016563599999999998}
+{"mode": "undolayer", "env": "retail", "task": 29, "reward": 0.0, "cost": 0.013618000000000002, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["exchange_delivered_order_items", "require_approval"], ["modify_pending_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 30, "reward": 0.0, "cost": 0.023758799999999993}
+{"mode": "undolayer", "env": "retail", "task": 30, "reward": 0.0, "cost": 0.012652400000000003, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["exchange_delivered_order_items", "require_approval"], ["return_delivered_order_items", "require_approval"], ["return_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 31, "reward": 0.0, "cost": 0.006479599999999999}
+{"mode": "undolayer", "env": "retail", "task": 31, "reward": 0.0, "cost": 0.018495199999999996, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["cancel_pending_order", "require_approval"], ["return_delivered_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 32, "reward": 0.0, "cost": 0.012583599999999999}
+{"mode": "undolayer", "env": "retail", "task": 32, "reward": 0.0, "cost": 0.006122799999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 33, "reward": 1.0, "cost": 0.009666000000000001}
+{"mode": "undolayer", "env": "retail", "task": 33, "reward": 0.0, "cost": 0.008206, "strict_reward": 1.0, "oracle_reward": 1.0, "held": [["modify_user_address", "hold"]]}
+{"mode": "baseline", "env": "retail", "task": 34, "reward": 0.0, "cost": 0.012391600000000001}
+{"mode": "undolayer", "env": "retail", "task": 34, "reward": 0.0, "cost": 0.0075136000000000005, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 35, "reward": 0.0, "cost": 0.0160564}
+{"mode": "undolayer", "env": "retail", "task": 35, "reward": 0.0, "cost": 0.008849600000000001, "strict_reward": 0.0, "oracle_reward": 0.0, "held": []}
+{"mode": "baseline", "env": "retail", "task": 36, "reward": 0.0, "cost": 0.0168788}
+{"mode": "undolayer", "env": "retail", "task": 36, "reward": 0.0, "cost": 0.007238, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["modify_pending_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 37, "reward": 0.0, "cost": 0.0124884}
+{"mode": "undolayer", "env": "retail", "task": 37, "reward": 0.0, "cost": 0.0146684, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["modify_pending_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 38, "reward": 0.0, "cost": 0.011814400000000001}
+{"mode": "undolayer", "env": "retail", "task": 38, "reward": 0.0, "cost": 0.007630799999999999, "strict_reward": 0.0, "oracle_reward": 0.0, "held": [["modify_pending_order_items", "require_approval"]]}
+{"mode": "baseline", "env": "retail", "task": 39, "reward": 0.0, "cost": 0.0072736}
+{"mode": "undolayer", "env": "retail", "task": 39, "reward": 0.0, "cost": 0.007796399999999999, "strict_reward": 1.0, "oracle_reward": 1.0, "held": [["modify_user_address", "hold"]]}

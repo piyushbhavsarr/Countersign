@@ -1,0 +1,32 @@
+# Benchmark copy of registry/stripe.toml plus a round-trip test against the in-process API.
+[tool]
+name = "stripe"
+base_url = "https://api.stripe.com/v1"
+credential = "stripe"
+encoding = "form"
+
+[action.charge]
+kind = "compensable"
+request = { method = "POST", path = "/payment_intents", body = { amount = "$args.amount_cents", currency = "$args.currency", customer = "$args.customer", confirm = true, off_session = true } }
+params = { amount_cents = { type = "integer" }, currency = { type = "string" }, customer = { type = "string" } }
+required = ["amount_cents", "currency", "customer"]
+undo = { call = "refund", args = { payment_intent = "$response.id" } }
+lookup = { replay = true }
+side_effects = ["customer_email_receipt"]
+risk = "high"
+test = { args = { amount_cents = 100, currency = "usd", customer = "cus_test" }, state = { call = "net", args = {} } }
+
+[action.refund]
+kind = "irreversible"
+request = { method = "POST", path = "/refunds", body = { payment_intent = "$args.payment_intent" } }
+params = { payment_intent = { type = "string" } }
+
+[action.payout]
+kind = "irreversible"
+request = { method = "POST", path = "/payouts", body = { amount = "$args.amount_cents", currency = "$args.currency" } }
+params = { amount_cents = { type = "integer" }, currency = { type = "string" } }
+risk = "high"
+
+[action.net]
+kind = "read"
+request = { method = "GET", path = "/net" }
