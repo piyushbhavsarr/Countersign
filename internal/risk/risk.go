@@ -55,8 +55,8 @@ const maxStringFact = 48
 // its type, so a fact a connector adds later is learned from without code changes.
 func Features(a *model.Action) map[string]float64 {
 	f := map[string]float64{
-		"lane=" + string(a.Effect): 1,
-		"connector=" + a.Connector: 1,
+		"lane=" + string(a.Effect):              1,
+		"connector=" + a.Connector:              1,
 		"op=" + a.Connector + "/" + a.Operation: 1,
 	}
 	for k, v := range a.Facts {

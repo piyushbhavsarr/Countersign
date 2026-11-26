@@ -37,9 +37,9 @@ import (
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
 	"undolayer/internal/policy"
-	"undolayer/internal/risk"
 	"undolayer/internal/registry"
 	"undolayer/internal/review"
+	"undolayer/internal/risk"
 	"undolayer/internal/store"
 	"undolayer/internal/tx"
 )

@@ -162,6 +162,42 @@ To have named reviewers sign decisions with their own keys:
 undolayer reviewer keygen alice
 ```
 
+### Get the full record of any task
+
+Every approval and decline keeps a copy of exactly what the reviewer was shown, in the tamper-evident audit log. It stays there after the task commits, is undone, or fails.
+
+```sh
+undolayer evidence <tx> --out evidence.json -c undolayer.toml
+```
+
+One JSON document with everything about the task: what was asked, every action and its decision, what each reviewer approved or declined and what they saw, the before-state that undo restores (kept even after an undo), the outbox, every audit event, and whether the audit chain is intact.
+
+### Learn from your reviewers
+
+Countersign can train a small risk model on the decisions your reviewers have already made, so actions that look like ones they declined before get flagged automatically.
+
+```sh
+undolayer risk train -c undolayer.toml               # learns from approvals and declines in the audit log
+undolayer risk explain <tx> -c undolayer.toml        # each action's score and the features behind it
+```
+
+Then point the config at the model and add a rule on its score:
+
+```toml
+[risk]
+model = "risk-model.json"
+```
+
+```toml
+[[rule]]
+id = "learned-risk"
+decision = "require_approval"
+reason = "reviewers have declined actions like this"
+when = { risk_score = { gt = 0.85 } }
+```
+
+The model scores the same action the same way every time, explains each score, and adds caution where your reviewers were cautious. Rules only escalate, so it can never remove a check. You can also train on your own labelled data with `--data examples.jsonl`, one `{"action": {...}, "label": 0 or 1}` per line.
+
 ### Add any SaaS API
 
 ```sh
