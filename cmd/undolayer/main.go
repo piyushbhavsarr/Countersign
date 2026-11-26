@@ -7,6 +7,7 @@
 //	undolayer recover | worker [--once] | audit
 //	undolayer registry test|list <path>
 //	undolayer hook claude-code | setup claude-code
+//	undolayer risk train [--data examples.jsonl] [--out risk-model.json] | risk explain <tx>
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
 
@@ -39,6 +40,7 @@ import (
 	"undolayer/internal/mcp"
 	"undolayer/internal/registry"
 	"undolayer/internal/review"
+	"undolayer/internal/risk"
 	rt "undolayer/internal/runtime"
 	"undolayer/internal/sandbox"
 	"undolayer/internal/tx"
@@ -135,6 +137,10 @@ func main() {
 			die(fmt.Errorf("FAIL %s: %v", fs.Arg(1), err))
 		}
 		fmt.Printf("PASS %s: create, update, undo and delete round trip; its changes are now undoable\n", fs.Arg(1))
+		return
+	case "risk":
+		parseArgs(fs, args)
+		riskCmd(*cfgPath, fs.Args())
 		return
 	case "reviewer":
 		parseArgs(fs, args)
@@ -687,4 +693,103 @@ func parseArgs(fs *flag.FlagSet, args []string) {
 		}
 	}
 	_ = fs.Parse(append(known, append([]string{"--"}, rest...)...))
+}
+
+// riskCmd trains the risk model from reviewer decisions, or explains a task's scores.
+func riskCmd(cfgPath string, args []string) {
+	usage := errors.New("usage: undolayer risk train [--data examples.jsonl] [--out risk-model.json] [--epochs N] -c undolayer.toml\n" +
+		"       undolayer risk explain <tx> [--model risk-model.json] -c undolayer.toml")
+	if len(args) == 0 {
+		die(usage)
+	}
+	opt := func(name string) string {
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == name {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	c, m := load(cfgPath)
+	switch args[0] {
+	case "train":
+		examples, err := m.ReviewedExamples()
+		if err != nil {
+			die(err)
+		}
+		fromAudit := len(examples)
+		if f := opt("--data"); f != "" {
+			more, err := readExamples(f)
+			if err != nil {
+				die(err)
+			}
+			examples = append(examples, more...)
+		}
+		epochs, _ := strconv.Atoi(opt("--epochs"))
+		model, err := risk.Train(examples, risk.Options{Epochs: epochs})
+		if err != nil {
+			die(fmt.Errorf("%v (%d examples: %d from reviewer decisions in the audit log)", err, len(examples), fromAudit))
+		}
+		dest := opt("--out")
+		if dest == "" {
+			dest = c.Abs("risk-model.json")
+		}
+		if err := model.Save(dest); err != nil {
+			die(err)
+		}
+		out(map[string]any{"model": dest, "examples": len(examples), "from_reviewer_decisions": fromAudit,
+			"risky": model.Positives, "training_accuracy": model.Accuracy(examples, 0.5),
+			"next": "set [risk] model = \"" + dest + "\" and add a rule on risk_score, e.g. when = { risk_score = { gt = 0.85 } }"})
+	case "explain":
+		if len(args) < 2 {
+			die(usage)
+		}
+		rm := m.Policy.Risk
+		if f := opt("--model"); f != "" {
+			var err error
+			if rm, err = risk.Load(f); err != nil {
+				die(err)
+			}
+		}
+		if rm == nil {
+			die(errors.New("no model: set [risk] model in the config, or pass --model"))
+		}
+		t, err := m.Get(args[1])
+		if err != nil {
+			die(err)
+		}
+		rows := []map[string]any{}
+		for _, a := range t.Actions {
+			score, signals := rm.Score(a)
+			rows = append(rows, map[string]any{"action": a.ID, "call": a.Connector + "." + a.Operation,
+				"decision": a.Decision, "risk_score": score, "because": signals})
+		}
+		out(map[string]any{"tx": t.ID, "task": t.Task, "actions": rows})
+	default:
+		die(usage)
+	}
+}
+
+// readExamples reads JSON lines of {"action": {...}, "label": 0|1}.
+func readExamples(path string) ([]risk.Example, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []risk.Example
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	for n := 1; sc.Scan(); n++ {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var e risk.Example
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			return nil, fmt.Errorf("%s:%d: %v", path, n, err)
+		}
+		out = append(out, e)
+	}
+	return out, sc.Err()
 }

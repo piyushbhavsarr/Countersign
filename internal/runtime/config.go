@@ -37,6 +37,7 @@ import (
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
 	"undolayer/internal/policy"
+	"undolayer/internal/risk"
 	"undolayer/internal/registry"
 	"undolayer/internal/review"
 	"undolayer/internal/store"
@@ -120,6 +121,11 @@ type Config struct {
 		Requester         string   `toml:"requester"`           // who asks for tasks (default: the OS user)
 	} `toml:"approvals"`
 	// [reviewers.<name>] key = "ssh-ed25519 AAAA... alice", roles = [...], users = [...]
+	// Risk: a model trained with `undolayer risk train` scores every action (the fact
+	// risk_score, 0 to 1); policy rules decide what a score means.
+	Risk struct {
+		Model string `toml:"model"`
+	} `toml:"risk"`
 	Reviewers map[string]map[string]any `toml:"reviewers"`
 	// [[approval_rule]] id, connector, operation, effect, when, roles, count, reason
 	ApprovalRules []map[string]any `toml:"approval_rule"`
@@ -179,6 +185,13 @@ func Build(c *Config) (*tx.Manager, *workspace.FS, error) {
 			return nil, nil, err
 		}
 		pol = pol.Extend(p)
+	}
+	if c.Risk.Model != "" {
+		rm, err := risk.Load(c.Abs(c.Risk.Model))
+		if err != nil {
+			return nil, nil, fmt.Errorf("[risk] model: %v", err)
+		}
+		pol.Risk = rm
 	}
 	var m *tx.Manager
 	var err error
