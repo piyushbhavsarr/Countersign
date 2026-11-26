@@ -48,6 +48,7 @@ func (m *Manager) DecideAction(t *Tx, actionID, approver, decision string) error
 		return err
 	}
 	m.audit("action_decision", map[string]any{"tx": t.ID, "action_id": actionID, "decision": decision, "approver": approver})
+	m.recordEvidence(t, "action", actionID, decision, approver, actionEvidence(a))
 	return nil
 }
 
@@ -154,6 +155,7 @@ func (m *Manager) DeclineCommit(t *Tx, approver string) error {
 		return err
 	}
 	m.audit("commit_declined", map[string]any{"tx": t.ID, "approver": approver, "preview_hash": h})
+	m.recordEvidence(t, "commit", h, "decline", approver, t.Preview())
 	return nil
 }
 

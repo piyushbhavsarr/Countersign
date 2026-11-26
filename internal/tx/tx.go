@@ -779,6 +779,7 @@ func (t *Tx) Approve(approver, token string) error {
 		return err
 	}
 	t.Mgr.audit("approve", map[string]any{"tx": t.ID, "approver": approver, "preview_hash": h})
+	t.Mgr.recordEvidence(t, "commit", h, "approve", approver, t.Preview())
 	return nil
 }
 
