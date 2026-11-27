@@ -32,8 +32,9 @@ type Store interface {
 	TryLock(id string) (Lock, bool)
 	AppendApproval(id string, rec []byte) error
 	Approvals(id string) ([][]byte, error)
-	// AppendAudit appends next(last line) atomically with respect to every other appender.
-	AppendAudit(next func(prev []byte) ([]byte, error)) error
+	// AppendAudit appends the lines next(last line) returns, in order, atomically with
+	// respect to every other appender, and makes them durable together (one sync).
+	AppendAudit(next func(prev []byte) ([][]byte, error)) error
 	AuditLines(fn func(line []byte) error) error
 	// Key returns a named 32-byte secret, creating it once.
 	Key(name string) ([]byte, error)

@@ -188,9 +188,13 @@ type Options struct {
 var ErrNoQuorum = errors.New("vault: write quorum not reached")
 
 type Vault struct {
-	o      Options
-	mu     sync.Mutex
-	shared [][]string
+	o  Options
+	mu sync.Mutex
+	// group commit
+	qmu     sync.Mutex
+	queue   []*waiter
+	leading bool
+	shared  [][]string
 	// hook, if set, is called before each replica operation (tests inject faults with it).
 	hook func(replica string, op string) error
 }
@@ -672,6 +676,11 @@ type Receipt struct {
 
 // Append stores an entry on at least WriteQuorum replicas, or returns an error wrapping
 // ErrNoQuorum (some replicas may then hold it: such records are harmless and are kept).
+//
+// Group commit: entries appended at the same time (from any goroutine of this process)
+// are written together, one write and one sync per replica for the whole batch, and each
+// returns once the batch is on a quorum. The first caller to arrive writes; the others
+// wait for it, and whoever arrives while a batch is being written goes in the next one.
 func (v *Vault) Append(e Entry) (*Receipt, error) {
 	if e.Tx == "" || e.Connector == "" || e.Phase == "" {
 		return nil, errors.New("vault: an entry needs tx, connector and phase")
@@ -681,16 +690,61 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 	if err != nil {
 		return nil, err
 	}
+	w := &waiter{recs: recs, done: make(chan struct{})}
+	v.qmu.Lock()
+	v.queue = append(v.queue, w)
+	if v.leading {
+		v.qmu.Unlock()
+		<-w.done
+		return w.rc, w.err
+	}
+	v.leading = true
+	v.qmu.Unlock()
+	for {
+		v.qmu.Lock()
+		group := v.queue
+		v.queue = nil
+		if len(group) == 0 {
+			v.leading = false
+			v.qmu.Unlock()
+			break
+		}
+		v.qmu.Unlock()
+		v.appendGroup(group)
+		for _, g := range group {
+			close(g.done)
+		}
+	}
+	<-w.done
+	return w.rc, w.err
+}
+
+type waiter struct {
+	recs []*Record
+	rc   *Receipt
+	err  error
+	done chan struct{}
+}
+
+// appendGroup writes a group of entries as one batch.
+func (v *Vault) appendGroup(group []*waiter) {
+	fail := func(err error) {
+		for _, g := range group {
+			g.err = err
+		}
+	}
 	unlock, err := v.lock()
 	if err != nil {
-		return nil, err
+		fail(err)
+		return
 	}
 	defer unlock()
 
 	tails, ok, problems := v.tails()
 	if reach := count(ok); reach < v.o.WriteQuorum {
-		return nil, fmt.Errorf("%w: %d of %d replicas reachable, %d needed (%s)", ErrNoQuorum, reach,
-			len(v.o.Replicas), v.o.WriteQuorum, strings.Join(problems, "; "))
+		fail(fmt.Errorf("%w: %d of %d replicas reachable, %d needed (%s)", ErrNoQuorum, reach,
+			len(v.o.Replicas), v.o.WriteQuorum, strings.Join(problems, "; ")))
+		return
 	}
 	// Fast path: every reachable replica ends at the same record. Otherwise some missed
 	// writes or hold records that lost a quorum race: reconcile them first.
@@ -714,8 +768,9 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 			}
 		}
 		if reach := count(ok); reach < v.o.WriteQuorum {
-			return nil, fmt.Errorf("%w: %d of %d replicas agree, %d needed (%s)", ErrNoQuorum, reach,
-				len(v.o.Replicas), v.o.WriteQuorum, strings.Join(problems, "; "))
+			fail(fmt.Errorf("%w: %d of %d replicas agree, %d needed (%s)", ErrNoQuorum, reach,
+				len(v.o.Replicas), v.o.WriteQuorum, strings.Join(problems, "; ")))
+			return
 		}
 	}
 	var head tail
@@ -726,13 +781,18 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 		}
 	}
 	seq, prev := head.seq, head.sum
-	for _, r := range recs {
-		seq++
-		r.Seq, r.Prev = seq, prev
-		if _, err := encode(r); err != nil {
-			return nil, err
+	var all []*Record
+	for _, g := range group {
+		for _, r := range g.recs {
+			seq++
+			r.Seq, r.Prev = seq, prev
+			if _, err := encode(r); err != nil {
+				fail(err)
+				return
+			}
+			prev = r.sum
+			all = append(all, r)
 		}
-		prev = r.sum
 	}
 	var wg sync.WaitGroup
 	var pmu sync.Mutex
@@ -744,7 +804,7 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 		wg.Add(1)
 		go func(i int, r string) {
 			defer wg.Done()
-			err := v.writeReplica(r, tails[i], recs)
+			err := v.writeReplica(r, tails[i], all)
 			pmu.Lock()
 			defer pmu.Unlock()
 			if err != nil {
@@ -756,11 +816,15 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 	}
 	wg.Wait()
 	if copies < v.o.WriteQuorum {
-		return nil, fmt.Errorf("%w: %d of %d replicas stored it, %d needed (%s)", ErrNoQuorum, copies,
-			len(v.o.Replicas), v.o.WriteQuorum, strings.Join(problems, "; "))
+		fail(fmt.Errorf("%w: %d of %d replicas stored it, %d needed (%s)", ErrNoQuorum, copies,
+			len(v.o.Replicas), v.o.WriteQuorum, strings.Join(problems, "; ")))
+		return
 	}
-	return &Receipt{Batch: batch, FirstSeq: recs[0].Seq, LastSeq: recs[len(recs)-1].Seq, LastSum: prev,
-		Copies: copies, Replicas: len(v.o.Replicas)}, nil
+	for _, g := range group {
+		last := g.recs[len(g.recs)-1]
+		g.rc = &Receipt{Batch: g.recs[0].Batch, FirstSeq: g.recs[0].Seq, LastSeq: last.Seq, LastSum: last.sum,
+			Copies: copies, Replicas: len(v.o.Replicas)}
+	}
 }
 
 // tails reads every replica's tail (only those marked in only, if given).

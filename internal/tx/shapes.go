@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"undolayer/internal/model"
 )
@@ -17,10 +18,11 @@ import (
 // runtime adds shape_new (this requester never committed a query of this shape) for policy.
 
 type shapeBook struct {
-	mu    sync.Mutex
-	path  string
-	size  int64
-	known map[string]bool
+	mu      sync.Mutex
+	path    string
+	size    int64
+	known   map[string]bool
+	checked time.Time
 }
 
 func (m *Manager) shapeBook() *shapeBook {
@@ -40,8 +42,13 @@ type shapeLine struct {
 
 func shapeKey(l shapeLine) string { return l.Requester + "\x00" + l.Connector + "\x00" + l.Shape }
 
-// load rereads the file when another process has added to it.
+// load rereads the file when another process has added to it (looked at most every
+// 250ms; this process's own shapes are known at once).
 func (b *shapeBook) load() {
+	if time.Since(b.checked) < 250*time.Millisecond {
+		return
+	}
+	b.checked = time.Now()
 	fi, err := os.Stat(b.path)
 	if err != nil || fi.Size() == b.size {
 		return
@@ -73,6 +80,7 @@ func (b *shapeBook) Known(requester, connector, shape string) bool {
 func (b *shapeBook) Learn(ls []shapeLine) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.checked = time.Time{}
 	b.load()
 	var buf []byte
 	for _, l := range ls {

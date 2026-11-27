@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // An agent's HTTP request may not reach cloud metadata, private networks, other schemes,
@@ -43,6 +44,7 @@ func TestAPICallsAreKeptInTheVault(t *testing.T) {
 	if err := os.Remove(filepath.Join(w.State, "tx", x.ID+".json")); err != nil {
 		t.Fatal(err)
 	}
+	_ = w.Mgr.Flush() // another process reads what this one wrote
 	m2 := w.MakeManager()
 	m2.Vault = w.Mgr.Vault
 	crs, err := m2.ChangedRows(x.ID)
@@ -116,6 +118,7 @@ func TestFreezeStopsARequesterEverywhere(t *testing.T) {
 	if err := w.Mgr.Unfreeze(x.Requester, "alice"); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(300 * time.Millisecond) // other gateways see a change to the list within 250ms for reads
 	if _, err := y.Call("sql", "query", map[string]any{"sql": "SELECT 1"}); err != nil {
 		t.Fatalf("after unfreeze: %v", err)
 	}

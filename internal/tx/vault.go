@@ -52,7 +52,7 @@ func (t *Tx) vaultAppend(e vault.Entry) (*vault.Receipt, error) {
 			"error": err.Error()})
 		return nil, err
 	}
-	t.Mgr.audit("vault_append", map[string]any{"tx": t.ID, "connector": e.Connector, "phase": e.Phase,
+	t.Mgr.note("vault_append", map[string]any{"tx": t.ID, "connector": e.Connector, "phase": e.Phase,
 		"batch": rc.Batch, "first_seq": rc.FirstSeq, "last_seq": rc.LastSeq, "last_sum": rc.LastSum,
 		"copies": rc.Copies, "replicas": rc.Replicas, "rows": len(e.Rows)})
 	return rc, nil
@@ -72,12 +72,15 @@ func (t *Tx) vaultSettle(name, phase, ref string, intent, final json.RawMessage)
 	} else {
 		e = vault.Entry{Tx: t.ID, Task: t.Task, Requester: t.Requester, Connector: name, Phase: phase, Ref: ref}
 	}
-	if err == nil {
-		_, err = t.vaultAppend(e)
-	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "undolayer: vault: recording that %s %s for %s: %v\n", name, phase, t.ID, err)
+		return
 	}
+	t.Mgr.vaultLater(func() {
+		if _, err := t.vaultAppend(e); err != nil {
+			fmt.Fprintf(os.Stderr, "undolayer: vault: recording that %s %s for %s: %v\n", name, phase, t.ID, err)
+		}
+	})
 }
 
 // ChangedRows is what a task changed in one connector, as kept by the journal or vault.
@@ -102,6 +105,7 @@ type ChangedRows struct {
 // can put it back. It reads the journal first; if the task's journal is gone or holds no
 // record, it reads the vault.
 func (m *Manager) ChangedRows(id string) ([]ChangedRows, error) {
+	m.later.Wait() // this process's own background vault writes first
 	var out []ChangedRows
 	t, err := m.Get(id)
 	if err == nil {
@@ -253,7 +257,20 @@ func (t *Tx) vaultCallDone(a *model.Action, batch, phase string, result any, com
 	if phase == "committed" {
 		e.Rows = []vault.Row{callRow(a, result)}
 	}
-	if _, err := t.vaultAppend(e); err != nil {
-		fmt.Fprintf(os.Stderr, "undolayer: vault: recording the result of %s.%s in %s: %v\n", a.Connector, a.Operation, t.ID, err)
-	}
+	t.Mgr.vaultLater(func() {
+		if _, err := t.vaultAppend(e); err != nil {
+			fmt.Fprintf(os.Stderr, "undolayer: vault: recording the result of %s.%s in %s: %v\n", a.Connector, a.Operation, t.ID, err)
+		}
+	})
+}
+
+// vaultLater runs a vault write that nothing waits for (how a change ended: the intent,
+// written before it, already holds everything needed to put it back, and readers settle
+// an intent from the task's journal when this record is missing). Flush waits for them.
+func (m *Manager) vaultLater(fn func()) {
+	m.later.Add(1)
+	go func() {
+		defer m.later.Done()
+		fn()
+	}()
 }

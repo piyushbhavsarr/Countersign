@@ -208,7 +208,7 @@ func (p *Postgres) Approvals(id string) ([][]byte, error) {
 	return out, rows.Err()
 }
 
-func (p *Postgres) AppendAudit(next func(prev []byte) ([]byte, error)) error {
+func (p *Postgres) AppendAudit(next func(prev []byte) ([][]byte, error)) error {
 	c, cancel := ctx()
 	defer cancel()
 	tx, err := p.pool.Begin(c)
@@ -228,12 +228,14 @@ func (p *Postgres) AppendAudit(next func(prev []byte) ([]byte, error)) error {
 	default:
 		prev = []byte(last)
 	}
-	line, err := next(prev)
+	lines, err := next(prev)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(c, `INSERT INTO undolayer_audit (line) VALUES ($1)`, string(line)); err != nil {
-		return err
+	for _, l := range lines { // one by one, so seq follows the chain; one commit for all
+		if _, err := tx.Exec(c, `INSERT INTO undolayer_audit (line) VALUES ($1)`, string(l)); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(c)
 }

@@ -59,6 +59,12 @@ type Manager struct {
 	approvalKey []byte
 	txs         map[string]*Tx
 	shapes      *shapeBook
+	later       sync.WaitGroup       // background vault writes
+	stamps      map[string][2]string // tx -> journal stamp and state, as last read
+	frozenMu    sync.Mutex
+	frozenCache map[string]Frozen
+	frozenErr   error
+	frozenAt    time.Time
 }
 
 func NewManager(stateDir string, pol *policy.Policy) (*Manager, error) {
@@ -97,6 +103,19 @@ func NewManagerWithStore(st store.Store, stateDir string, pol *policy.Policy) (*
 
 func (m *Manager) audit(event string, data map[string]any) {
 	_ = m.Audit.Record(event, normalizeMap(data))
+}
+
+// note audits an event that changes nothing (a read) without waiting for the disk; the
+// next durable event, or Flush, makes it durable too.
+func (m *Manager) note(event string, data map[string]any) {
+	m.Audit.Note(event, normalizeMap(data))
+}
+
+// Flush waits for background vault writes and makes every audit event so far durable
+// (call before the process exits).
+func (m *Manager) Flush() error {
+	m.later.Wait()
+	return m.Audit.Flush()
 }
 
 func normalizeMap(d map[string]any) map[string]any {
@@ -190,8 +209,11 @@ func (m *Manager) Begin(task string) *Tx {
 	m.mu.Lock()
 	m.txs[t.ID] = t
 	m.mu.Unlock()
-	m.audit("begin", map[string]any{"tx": t.ID, "task": task})
-	m.Journal(t)
+	m.note("begin", map[string]any{"tx": t.ID, "task": task})
+	// nothing has happened yet: the journal is written within a second, or before anything
+	// can escape (an effect, a hold for approval, a commit), whichever comes first
+	t.journaled = time.Now()
+	t.journalSoon()
 	return t
 }
 
@@ -234,7 +256,37 @@ func (m *Manager) List() []Summary {
 	return out
 }
 
+// journalState: a transaction's state as the store holds it. With a store that can stamp
+// versions (files), the journal is read again only when it changed since the last read.
 func (m *Manager) journalState(id string) string {
+	if st, ok := m.Store.(interface{ Stamp(string) (string, error) }); ok {
+		stamp, err := st.Stamp(id)
+		if err != nil {
+			return ""
+		}
+		m.mu.Lock()
+		c, hit := m.stamps[id]
+		m.mu.Unlock()
+		if hit && c[0] == stamp {
+			return c[1]
+		}
+		b, err := m.Store.LoadTx(id)
+		if err != nil {
+			return ""
+		}
+		var d struct{ State string }
+		_ = json.Unmarshal(b, &d)
+		m.mu.Lock()
+		if m.stamps == nil {
+			m.stamps = map[string][2]string{}
+		}
+		if len(m.stamps) > 10000 {
+			m.stamps = map[string][2]string{}
+		}
+		m.stamps[id] = [2]string{stamp, d.State}
+		m.mu.Unlock()
+		return d.State
+	}
 	b, err := m.Store.LoadTx(id)
 	if err != nil {
 		return ""

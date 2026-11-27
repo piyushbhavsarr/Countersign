@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -45,6 +46,16 @@ func (f *Files) SaveTx(id string, doc []byte) error {
 		return err
 	}
 	return os.Rename(tmp, p)
+}
+
+// Stamp identifies the current version of a transaction's journal (size and change time),
+// so a reader can tell, with one stat, whether it changed since it last read it.
+func (f *Files) Stamp(id string) (string, error) {
+	fi, err := os.Stat(f.path(id, ".json"))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d.%d.%d", fi.Size(), fi.ModTime().UnixNano(), inode(fi)), nil
 }
 
 func (f *Files) LoadTx(id string) ([]byte, error) {
@@ -125,7 +136,7 @@ func (f *Files) Approvals(id string) ([][]byte, error) {
 
 func (f *Files) auditPath() string { return filepath.Join(f.Dir, "audit.jsonl") }
 
-func (f *Files) AppendAudit(next func(prev []byte) ([]byte, error)) error {
+func (f *Files) AppendAudit(next func(prev []byte) ([][]byte, error)) error {
 	fh, err := os.OpenFile(f.auditPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
@@ -139,11 +150,15 @@ func (f *Files) AppendAudit(next func(prev []byte) ([]byte, error)) error {
 	if err != nil {
 		return err
 	}
-	line, err := next(prev)
+	lines, err := next(prev)
 	if err != nil {
 		return err
 	}
-	if _, err := fh.Write(append(line, '\n')); err != nil {
+	var buf []byte
+	for _, l := range lines {
+		buf = append(append(buf, l...), '\n')
+	}
+	if _, err := fh.Write(buf); err != nil {
 		return err
 	}
 	return fh.Sync()
@@ -234,4 +249,11 @@ func (f *Files) Put(name string, b []byte) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(d, name))
+}
+
+func inode(fi os.FileInfo) uint64 {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Ino) // a rename (every journal write) gives a new inode
+	}
+	return 0
 }

@@ -57,8 +57,14 @@ const version = "0.3.0"
 
 var jsonOut *bool
 
+// loaded is the manager of this run, flushed before the process exits.
+var loaded *tx.Manager
+
 func die(err error) {
 	fmt.Fprintln(os.Stderr, "undolayer:", err)
+	if loaded != nil {
+		_ = loaded.Flush()
+	}
 	os.Exit(1)
 }
 
@@ -77,10 +83,16 @@ func load(cfgPath string) (*rt.Config, *tx.Manager) {
 	if err != nil {
 		die(err)
 	}
+	loaded = m
 	return c, m
 }
 
 func main() {
+	defer func() {
+		if loaded != nil {
+			_ = loaded.Flush()
+		}
+	}()
 	egress.MaybeNetinit()
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: undolayer <run|serve|connect|list|show|approve|rollback|undo|recover|worker|audit|registry|hook|setup|bench> ...")
@@ -301,6 +313,7 @@ func main() {
 		go mcp.Worker(m, 5*time.Second, stop)
 		mcp.NewSession(m, version).Serve(os.Stdin, os.Stdout)
 		close(stop)
+		_ = m.Flush()
 	case "run":
 		parseArgs(fs, args)
 		runAgent(*cfgPath, fs.Args())

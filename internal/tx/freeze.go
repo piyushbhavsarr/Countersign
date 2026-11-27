@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"undolayer/internal/model"
 )
@@ -43,6 +44,9 @@ func (m *Manager) Freeze(requester, by, reason string) error {
 	if err := m.Store.Put(frozenDoc, b); err != nil {
 		return err
 	}
+	m.frozenMu.Lock()
+	m.frozenCache = nil // this process sees it at once
+	m.frozenMu.Unlock()
 	m.audit("freeze", map[string]any{"requester": requester, "by": by, "reason": reason})
 	return nil
 }
@@ -61,6 +65,9 @@ func (m *Manager) Unfreeze(requester, by string) error {
 	if err := m.Store.Put(frozenDoc, b); err != nil {
 		return err
 	}
+	m.frozenMu.Lock()
+	m.frozenCache = nil
+	m.frozenMu.Unlock()
 	m.audit("unfreeze", map[string]any{"requester": requester, "by": by})
 	return nil
 }
@@ -77,9 +84,19 @@ func (m *Manager) FrozenRequesters() ([]Frozen, error) {
 }
 
 // frozen returns why the task's requester is frozen, or "". A store that cannot be read
-// counts as frozen: the switch must not fail open.
-func (t *Tx) frozen() string {
-	l, err := t.Mgr.frozenList()
+// counts as frozen: the switch must not fail open. Anything that can change something
+// reads the list every time; a read (fresh=false) may use a copy at most 250ms old.
+func (t *Tx) frozen(fresh ...bool) string {
+	m := t.Mgr
+	m.frozenMu.Lock()
+	l, err, at := m.frozenCache, m.frozenErr, m.frozenAt
+	m.frozenMu.Unlock()
+	if (len(fresh) > 0 && fresh[0]) || l == nil || time.Since(at) > 250*time.Millisecond {
+		l, err = m.frozenList()
+		m.frozenMu.Lock()
+		m.frozenCache, m.frozenErr, m.frozenAt = l, err, time.Now()
+		m.frozenMu.Unlock()
+	}
 	if err != nil {
 		return "the freeze list cannot be read (" + err.Error() + "), so nothing runs"
 	}

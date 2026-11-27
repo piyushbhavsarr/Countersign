@@ -30,6 +30,7 @@ func withVault(t *testing.T, w *bench.World, m *tx.Manager) []string {
 		t.Fatal(err)
 	}
 	m.Vault = v
+	t.Cleanup(func() { _ = m.Flush() }) // background vault writes finish before the directories go
 	return v.Replicas()
 }
 
@@ -109,6 +110,7 @@ func TestVaultKeepsDeletedRowsEvenWithoutTheJournal(t *testing.T) {
 	if err := os.Remove(filepath.Join(w.State, "tx", x.ID+".json")); err != nil {
 		t.Fatal(err)
 	}
+	_ = w.Mgr.Flush() // another process reads what this one wrote
 	m2 := w.MakeManager()
 	m2.Vault = w.Mgr.Vault
 	crs, err := m2.ChangedRows(x.ID)
@@ -397,6 +399,7 @@ func TestRestoreFilesFromTheVault(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = os.Remove(filepath.Join(w.State, "tx", x.ID+".json")) // and the journal
+	_ = w.Mgr.Flush()                                         // another process reads what this one wrote
 	m2 := w.MakeManager()
 	m2.Vault = w.Mgr.Vault
 	y := m2.Begin("bring them back")
