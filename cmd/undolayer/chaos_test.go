@@ -153,9 +153,11 @@ func TestCrashesNeverLeaveATaskHalfDone(t *testing.T) {
 		if rng.Intn(2) == 0 {
 			killAt = 4 // half the runs: during commit
 		}
+		txID := ""
 		steps := []func() error{
 			func() error {
-				_, err := c.tool("undolayer_begin", map[string]any{"task": fmt.Sprintf("close order %d", i)})
+				r, err := c.tool("undolayer_begin", map[string]any{"task": fmt.Sprintf("close order %d", i)})
+				txID = fmt.Sprint(r["tx"])
 				return err
 			},
 			func() error {
@@ -207,6 +209,34 @@ func TestCrashesNeverLeaveATaskHalfDone(t *testing.T) {
 		if killAt < 4 && (deleted || written || charged) {
 			t.Fatalf("run %d: a task killed before commit left effects", i)
 		}
+		// the vault rule: a delete that happened has its row in the vault
+		if deleted {
+			out, err := exec.Command(bin, "changes", txID, "-c", cfg).Output()
+			if err != nil {
+				t.Fatalf("run %d: changes %s: %v", i, txID, err)
+			}
+			var doc struct {
+				Changes []struct {
+					Rows []struct {
+						Op     string         `json:"op"`
+						Before map[string]any `json:"before"`
+					} `json:"rows"`
+				} `json:"changes"`
+			}
+			_ = json.Unmarshal(out, &doc)
+			found := false
+			for _, ch := range doc.Changes {
+				for _, r := range ch.Rows {
+					found = found || (r.Op == "delete" && fmt.Sprint(r.Before["id"]) == fmt.Sprint(i) && r.Before["note"] == "x")
+				}
+			}
+			if !found {
+				t.Fatalf("run %d (killed at step %d): row %d was deleted but is not in the vault: %s", i, killAt, i, out)
+			}
+		}
+	}
+	if out, err := exec.Command(bin, "vault", "check", "-c", cfg).CombinedOutput(); err != nil {
+		t.Fatalf("vault after crashes: %v %s", err, out)
 	}
 	out, err := exec.Command(bin, "audit", "-c", cfg).CombinedOutput()
 	if err != nil || !strings.HasPrefix(string(out), "OK") {
@@ -282,7 +312,9 @@ root = "ws"
 dsn = "app.db"
 [registry]
 paths = [%q]
-`, filepath.Join(dir, "state"), reg)), 0o644)
+[vault]
+replicas = [%q, %q, %q]
+`, filepath.Join(dir, "state"), reg, filepath.Join(dir, "vault-a"), filepath.Join(dir, "vault-b"), filepath.Join(dir, "vault-c"))), 0o644)
 	if out, err := exec.Command(bin, "registry", "test", reg, "-c", cfg).CombinedOutput(); err != nil {
 		t.Fatalf("the payment tool did not pass its round trip: %v\n%s", err, out)
 	}

@@ -9,6 +9,10 @@
 //	undolayer hook claude-code | setup claude-code
 //	undolayer evidence <tx> [--out evidence.json]   everything about a task, as JSON
 //	undolayer risk train [--data examples.jsonl] [--out risk-model.json] | risk explain <tx>
+//	undolayer changes <tx> [--table T] [--op delete] [--format json|csv|sql] [--out file]
+//	undolayer restore <tx> [--table T] [--key '{"id":42}'] [--on-conflict skip] [--dry-run] [--yes]
+//	undolayer revert --requester NAME [--since 2h] [--until TIME] [--dry-run] [--yes]
+//	undolayer vault check | repair | keys | rotate-key | shred-key <id>
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
 
@@ -169,6 +173,12 @@ func main() {
 	case "risk":
 		parseArgs(fs, args)
 		riskCmd(*cfgPath, fs.Args())
+		return
+	case "changes", "restore", "revert", "vault":
+		parseArgs(fs, args)
+		_, m := load(*cfgPath)
+		map[string]func(*tx.Manager, []string){"changes": changesCmd, "restore": restoreCmd, "revert": revertCmd,
+			"vault": vaultCmd}[cmd](m, fs.Args())
 		return
 	case "reviewer":
 		parseArgs(fs, args)
