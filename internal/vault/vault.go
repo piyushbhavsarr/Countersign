@@ -175,6 +175,11 @@ type Options struct {
 	// RequireIndependent refuses to open when two replicas are on the same device (they
 	// would be lost together).
 	RequireIndependent bool
+	// Archive: sealed segments are copied, write-once, to object storage.
+	Archive *Archive
+	// MaxSegmentAge closes a segment once it is this old, so it can be archived (default
+	// 5 minutes with an archive, none without).
+	MaxSegmentAge time.Duration
 	// SegmentBytes: a segment is closed once it reaches this size (default 64 MiB).
 	SegmentBytes int64
 	// PartRows and PartBytes bound one record (defaults 1000 rows, 1 MiB of rows and undo).
@@ -192,6 +197,9 @@ type Vault struct {
 	mu sync.Mutex
 	// group commit
 	qmu       sync.Mutex
+	archiveMu sync.Mutex
+	bornMu    sync.Mutex
+	born      map[string]time.Time // when this process first saw each segment it writes to
 	queue     []*waiter
 	lazy      []*waiter
 	lazyTimer bool
@@ -241,6 +249,9 @@ func Open(o Options) (*Vault, error) {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.Archive != nil && o.MaxSegmentAge == 0 {
+		o.MaxSegmentAge = 5 * time.Minute
 	}
 	if err := os.MkdirAll(filepath.Dir(o.LockPath), 0o700); err != nil {
 		return nil, err
@@ -938,7 +949,7 @@ func (v *Vault) writeReplica(r string, t tail, recs []*Record) error {
 	}
 	p := t.seg
 	created := false
-	if p == "" || t.size >= v.o.SegmentBytes {
+	if p == "" || t.size >= v.o.SegmentBytes || v.tooOld(p) {
 		p, created = segName(r, recs[0].Seq), true
 	}
 	if err := v.fault(r, "write"); err != nil {
@@ -983,4 +994,23 @@ func (v *Vault) writeReplica(r string, t tail, recs []*Record) error {
 		_ = v.catchUpIndex(r)
 	}
 	return nil
+}
+
+// tooOld: the segment has been written to for longer than MaxSegmentAge (it is closed so
+// it can be archived). Age counts from when this process first wrote to it.
+func (v *Vault) tooOld(p string) bool {
+	if v.o.MaxSegmentAge <= 0 {
+		return false
+	}
+	v.bornMu.Lock()
+	defer v.bornMu.Unlock()
+	if v.born == nil {
+		v.born = map[string]time.Time{}
+	}
+	b, ok := v.born[p]
+	if !ok {
+		v.born[p] = v.o.Now()
+		return false
+	}
+	return v.o.Now().Sub(b) > v.o.MaxSegmentAge
 }

@@ -52,6 +52,7 @@ import (
 	rt "undolayer/internal/runtime"
 	"undolayer/internal/sandbox"
 	"undolayer/internal/tx"
+	"undolayer/internal/vault"
 )
 
 const version = "0.3.0"
@@ -317,6 +318,9 @@ func main() {
 		}
 		stop := make(chan struct{})
 		go mcp.Worker(m, 5*time.Second, stop)
+		if m.Vault != nil {
+			m.Vault.StartArchiver(stop, nil)
+		}
 		mcp.NewSession(m, version).Serve(os.Stdin, os.Stdout)
 		close(stop)
 		_ = m.Flush()
@@ -426,6 +430,15 @@ func manage(cmd, cfgPath string, fs *flag.FlagSet) {
 		once := false
 		for _, a := range fs.Args() {
 			once = once || a == "--once"
+		}
+		stopArch := make(chan struct{})
+		defer close(stopArch)
+		if m.Vault != nil {
+			m.Vault.StartArchiver(stopArch, func(r *vault.ArchiveReport, err error) {
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "vault archive:", err)
+				}
+			})
 		}
 		for {
 			r := map[string]any{"recovered": m.Recover(), "released": m.FlushDue()}

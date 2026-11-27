@@ -460,8 +460,25 @@ func vaultCmd(m *tx.Manager, args []string) {
 		}
 		_ = m.Audit.Record("vault_key_shredded", map[string]any{"key": args[1]})
 		fmt.Printf("shredded %s\n", args[1])
+	case "archive":
+		rep, err := m.Vault.ArchiveSealed()
+		if rep != nil {
+			out(rep)
+		}
+		if err != nil {
+			die(err)
+		}
+	case "restore-replica":
+		if len(args) < 2 {
+			die(errors.New("usage: undolayer vault restore-replica <empty replica directory>"))
+		}
+		n, err := m.Vault.RestoreReplica(args[1])
+		if err != nil {
+			die(err)
+		}
+		fmt.Printf("restored %d segments from the archive into %s; run: undolayer vault repair\n", n, args[1])
 	default:
-		die(errors.New("usage: undolayer vault check|repair|keys|rotate-key|shred-key <id> -c undolayer.toml"))
+		die(errors.New("usage: undolayer vault check|repair|keys|rotate-key|shred-key <id>|archive|restore-replica <dir> -c undolayer.toml"))
 	}
 }
 
@@ -687,9 +704,18 @@ func gatewayCmd(c *rt.Config, m *tx.Manager) {
 			}
 		}(g, l)
 	}
+	stop := make(chan struct{})
+	if m.Vault != nil {
+		m.Vault.StartArchiver(stop, func(r *vault.ArchiveReport, err error) {
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "vault archive:", err)
+			}
+		})
+	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	close(stop)
 	for i, g := range gws {
 		g.Close()
 		_ = ls[i].Close()

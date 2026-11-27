@@ -172,6 +172,19 @@ type Config struct {
 		Encrypt            *bool    `toml:"encrypt"`
 		KeyFile            string   `toml:"key_file"`
 		RequireIndependent bool     `toml:"require_independent_replicas"`
+		// [vault.archive]: sealed segments go, write-once (S3 Object Lock), to object storage:
+		// AWS S3, MinIO, R2, or GCS through its S3 interface; a bucket in another region is
+		// the vault's off-site copy. Keys come from the named environment variables.
+		Archive *struct {
+			Endpoint     string `toml:"endpoint"`
+			Region       string `toml:"region"`
+			Bucket       string `toml:"bucket"`
+			Prefix       string `toml:"prefix"`
+			AccessKeyEnv string `toml:"access_key_env"`
+			SecretKeyEnv string `toml:"secret_key_env"`
+			LockDays     int    `toml:"lock_days"`
+			Every        string `toml:"every"`
+		} `toml:"archive"`
 	} `toml:"vault"`
 	Reviewers map[string]map[string]any `toml:"reviewers"`
 	// [[approval_rule]] id, connector, operation, effect, when, roles, count, reason
@@ -284,7 +297,31 @@ func Build(c *Config) (*tx.Manager, *workspace.FS, error) {
 				return nil, nil, fmt.Errorf("[vault] key_file: %w", err)
 			}
 		}
-		v, err := vault.Open(vault.Options{Replicas: reps, WriteQuorum: c.Vault.WriteQuorum, Keys: keys,
+		var arch *vault.Archive
+		if a := c.Vault.Archive; a != nil {
+			if a.Endpoint == "" || a.Bucket == "" || a.AccessKeyEnv == "" || a.SecretKeyEnv == "" {
+				return nil, nil, errors.New("[vault.archive] needs endpoint, bucket, access_key_env and secret_key_env")
+			}
+			ak, sk := os.Getenv(a.AccessKeyEnv), os.Getenv(a.SecretKeyEnv)
+			if ak == "" || sk == "" {
+				return nil, nil, fmt.Errorf("[vault.archive]: %s and %s must be set", a.AccessKeyEnv, a.SecretKeyEnv)
+			}
+			region := a.Region
+			if region == "" {
+				region = "us-east-1"
+			}
+			every := 30 * time.Second
+			if a.Every != "" {
+				d, err := time.ParseDuration(a.Every)
+				if err != nil {
+					return nil, nil, fmt.Errorf("[vault.archive] every: %v", err)
+				}
+				every = d
+			}
+			arch = &vault.Archive{S3: &vault.S3{Endpoint: a.Endpoint, Region: region, Bucket: a.Bucket, AccessKey: ak, SecretKey: sk},
+				Prefix: a.Prefix, LockDays: a.LockDays, Every: every}
+		}
+		v, err := vault.Open(vault.Options{Replicas: reps, WriteQuorum: c.Vault.WriteQuorum, Keys: keys, Archive: arch,
 			RequireIndependent: c.Vault.RequireIndependent, LockPath: filepath.Join(c.StateDir, "vault.lock")})
 		if err != nil {
 			return nil, nil, fmt.Errorf("[vault]: %w", err)

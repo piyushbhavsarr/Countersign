@@ -193,8 +193,22 @@ Without a `[vault]` section, one copy is kept in `state_dir/vault`.
 - **Shredding.** Shredding a key makes everything it sealed unreadable on every replica, and in every backup of them. Use it for privacy erasure requests: rotate keys per period or per customer, then shred the one you need to.
 - **Fast lookups.** Each replica keeps an index by task, so finding one task's changes doesn't read the whole vault.
 
+Sealed segments can also go to object storage, written once under S3 Object Lock, so for the retention period nobody can delete or change them, whatever their credentials. A bucket in another region is the off-site copy. With an archive configured, segments close after 5 minutes, so the newest archived data is never more than that behind. A lost replica is rebuilt from the archive and then caught up from the others.
+
+```toml
+[vault.archive]
+endpoint = "https://s3.eu-central-1.amazonaws.com"   # or MinIO, R2, GCS (S3 interface)
+region = "eu-central-1"
+bucket = "acme-countersign-vault"                    # created with Object Lock enabled
+access_key_env = "VAULT_S3_KEY"
+secret_key_env = "VAULT_S3_SECRET"
+lock_days = 365
+```
+
 ```sh
 undolayer vault check  -c undolayer.toml     # every replica: records, missing, damaged, shared disks
+undolayer vault archive -c undolayer.toml    # upload sealed segments now (gateway, serve and worker do it every 30s)
+undolayer vault restore-replica /mnt/disk2/countersign -c undolayer.toml
 undolayer vault repair -c undolayer.toml
 undolayer vault keys | rotate-key | shred-key <id>
 ```
