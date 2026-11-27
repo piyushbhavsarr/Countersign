@@ -59,6 +59,7 @@ func (s *session) decideFresh(si *stmtInfo) (refuse bool, reason string) {
 		f["requester"], f["gateway"] = s.user, s.g.R.Name
 		if sh, _ := f["query_shape"].(string); sh != "" {
 			f["shape_new"] = s.g.shapes.learn(s.user, sh, si.text, s.g)
+			s.newShape[si] = f["shape_new"] == true
 		}
 		eff, op := model.Read, "query"
 		if writes {
@@ -139,32 +140,45 @@ func (s *session) query(text string) {
 		s.queryParts(si)
 	case kBegin:
 		s.inTx, s.writes, s.sqlSeen = true, false, nil
+		s.strict = false
 		s.forward(&pgproto3.Query{String: text}, &pending{kind: 'Q'})
 	case kCommit:
-		if s.inTx && s.writes {
+		if s.inTx && s.writes && s.strict {
 			s.commitSimple(text)
 		} else {
 			s.forward(&pgproto3.Query{String: text}, &pending{kind: 'Q'})
 		}
 		s.inTx, s.writes = false, false
+		s.strict = false
 	case kRollback:
 		s.inTx, s.writes = false, false
+		s.strict = false
 		s.forward(&pgproto3.Query{String: text}, &pending{kind: 'Q'})
 	case kWrite:
 		s.sqlSeen = append(s.sqlSeen, clip(text, 4000))
 		if s.inTx {
 			if !s.writes && !s.captureReady {
-				if _, err := s.iquery(captureSetup); err != nil {
+				if _, err := s.iquery(s.setupSQL()); err != nil {
 					s.fail(err)
 					return
 				}
 				s.setupPending = true // it holds once this transaction commits
 			}
 			s.writes = true
+			if s.isStrict(si) {
+				s.strict = true
+			}
 			s.forward(&pgproto3.Query{String: text}, &pending{kind: 'Q'})
 			return
 		}
-		s.autocommitSimple(text)
+		if s.isStrict(si) {
+			s.autocommitSimple(text)
+			return
+		}
+		// the fast lane: the write runs as it is; its before state goes to the outbox in
+		// its own (implicit) transaction, and to the vault in the background
+		s.sqlSeen = nil
+		s.forward(&pgproto3.Query{String: text}, &pending{kind: 'Q'})
 	default:
 		s.forward(&pgproto3.Query{String: text}, &pending{kind: 'Q'})
 	}
@@ -187,7 +201,7 @@ func (s *session) status() byte {
 func (s *session) autocommitSimple(text string) {
 	setup := "BEGIN"
 	if !s.captureReady {
-		setup = captureSetup + "; BEGIN" // outside the transaction: it stays even if this one rolls back
+		setup = s.setupSQL() + "; BEGIN" // outside the transaction: it stays even if this one rolls back
 	}
 	if _, err := s.iquery(setup); err != nil {
 		s.fail(err)
@@ -267,29 +281,37 @@ func (s *session) queryParts(si *stmtInfo) {
 		switch psi.kind {
 		case kBegin:
 			s.inTx, s.writes = true, false
+			s.strict = false
 		case kCommit:
-			if s.inTx && s.writes && s.status() != 'E' {
+			if s.inTx && s.writes && s.strict && s.status() != 'E' {
 				ok, why, batch, id := s.capture(false)
 				if !ok {
 					_, _ = s.iquery("ROLLBACK")
 					_ = s.sendClient(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42501", Message: "refused by Countersign: " + why},
 						&pgproto3.ReadyForQuery{TxStatus: 'I'})
 					s.inTx, s.writes, s.sqlSeen = false, false, nil
+					s.strict = false
 					return
 				}
 				defer s.settleAfter(id, batch)
 			}
 			s.inTx, s.writes = false, false
+			s.strict = false
 		case kRollback:
 			s.inTx, s.writes = false, false
+			s.strict = false
 		case kWrite:
 			s.sqlSeen = append(s.sqlSeen, clip(part, 4000))
+			if !s.inTx && !s.isStrict(psi) {
+				s.sqlSeen = nil
+				break // the fast lane: it runs as it is
+			}
 			if !s.inTx { // a write outside a transaction: as autocommitSimple, but quietly
 				if last {
 					s.autocommitSimple(part)
 					return
 				}
-				if _, err := s.iquery("BEGIN; " + captureSetup); err != nil {
+				if _, err := s.iquery("BEGIN; " + s.setupSQL()); err != nil {
 					s.fail(err)
 					return
 				}
@@ -313,12 +335,15 @@ func (s *session) queryParts(si *stmtInfo) {
 				continue
 			}
 			if !s.writes {
-				if _, err := s.iquery(captureSetup); err != nil {
+				if _, err := s.iquery(s.setupSQL()); err != nil {
 					s.fail(err)
 					return
 				}
 			}
 			s.writes = true
+			if s.isStrict(psi) {
+				s.strict = true
+			}
 		}
 		_ = before
 		s.forward(&pgproto3.Query{String: part}, e)
@@ -361,27 +386,38 @@ func (s *session) execute(m *pgproto3.Execute) {
 	switch si.kind {
 	case kBegin:
 		s.inTx, s.writes, s.sqlSeen = true, false, nil
+		s.strict = false
 	case kCommit:
-		if s.wrapped || (s.inTx && s.writes) {
+		if s.wrapped || (s.inTx && s.writes && s.strict) {
 			s.commitExtended(m)
 			s.inTx, s.writes, s.wrapped = false, false, false
+			s.strict = false
 			return
 		}
 		s.inTx, s.writes = false, false
+		s.strict = false
 	case kRollback:
 		s.inTx, s.writes, s.wrapped = false, false, false
+		s.strict = false
 	case kWrite:
 		s.sqlSeen = append(s.sqlSeen, clip(si.text, 4000))
-		if !s.inTx && !s.wrapped { // an autocommit write: the gateway opens the transaction
+		strict := s.isStrict(si)
+		if !s.inTx && !s.wrapped && !strict {
+			s.sqlSeen = nil
+			break // the fast lane: it runs as it is, in its own implicit transaction
+		}
+		if !s.inTx && !s.wrapped { // a strict autocommit write: the gateway opens the transaction
 			s.iexecAsync("BEGIN")
 			s.wrapped = true
 		}
 		if !s.writes && !s.captureReady {
-			s.iexecAsync("CREATE TEMP TABLE IF NOT EXISTS undolayer_log(seq bigserial PRIMARY KEY, tbl text, op text, old_row jsonb, new_row jsonb) ON COMMIT DELETE ROWS")
-			s.iexecAsync("SELECT set_config('undolayer.tx', 'gateway', false)")
+			s.iexecAsync(s.setupSQL())
 			s.setupPending = true
 		}
 		s.writes = true
+		if strict {
+			s.strict = true
+		}
 	}
 	s.forward(m, &pending{kind: 'E'})
 }
@@ -475,6 +511,7 @@ func (s *session) sync() {
 		_, _ = s.iquery("ROLLBACK")
 	}
 	s.inTx, s.writes = false, false
+	s.strict = false
 	s.settleAll()
 	s.toClient(&pgproto3.ReadyForQuery{TxStatus: 'I'}, true)
 }
@@ -515,8 +552,9 @@ type settleRef struct {
 // captureSelect: a first row saying whether capture is on in this transaction (and its
 // XID), then the captured rows in order. A transaction that wrote with capture off (if a
 // client found a way to turn it off) cannot commit: nothing would have kept its way back.
-const captureSelect = `SELECT 0, 0::bigint, current_setting('undolayer.tx', true), txid_current()::text, NULL::text, NULL::text
-UNION ALL SELECT 1, seq, tbl, op, old_row::text, new_row::text FROM pg_temp.undolayer_log ORDER BY 1, 2 LIMIT `
+const captureSelect = `WITH d AS (DELETE FROM undolayer.outbox WHERE xid = txid_current() RETURNING seq, tbl, op, old_row, new_row)
+SELECT 0, 0::bigint, current_setting('undolayer.tx', true), txid_current()::text, NULL::text, NULL::text
+UNION ALL SELECT 1, seq, tbl, op, old_row::text, new_row::text FROM d ORDER BY 1, 2 LIMIT `
 
 // capture reads what the transaction changed (captured row by row as it ran), measures it
 // against policy, and stores its before state in the vault, before the COMMIT goes on. It
@@ -795,4 +833,47 @@ func (s *session) istmt(name, sql string, ex *pending, flush bool) {
 		msgs = append(msgs, &pgproto3.Flush{})
 	}
 	s.internal(msgs, []*pending{{kind: 'C'}, {kind: 'P'}, {kind: 'B'}, ex, {kind: 'C'}})
+}
+
+// setupSQL turns capture on for this session: the outbox, who the client is, and the
+// commit budget the database holds.
+func (s *session) setupSQL() string {
+	return fmt.Sprintf("SELECT set_config('undolayer.tx', 'gateway', false), set_config('undolayer.user', %s, false), "+
+		"set_config('undolayer.max_rows', '%d', false), set_config('undolayer.max_fraction', '%g', false), set_config('undolayer.guard', %s, false)",
+		lit(s.user), s.g.R.MaxRows, s.g.R.MaxFraction, lit(s.g.R.Mode))
+}
+
+// isStrict: whether a write takes the strict lane (its before state in the vault before
+// COMMIT, judged on what it changed). Ordinary writes take the fast lane; a statement
+// with anything unusual about it does not: a shape its user never ran before, a sign of
+// injection, a call into user code, a write through a query, COPY from outside, a schema
+// change; and nothing does while capture is not confirmed on in this session.
+func (s *session) isStrict(si *stmtInfo) bool {
+	if s.g.R.Lane == "strict" || !s.captureReady {
+		return true
+	}
+	if s.newShape[si] { // the first time its user runs this shape: once, strict
+		delete(s.newShape, si)
+		return true
+	}
+	if v, ok := s.strictMemo[si]; ok {
+		return v
+	}
+	f := si.facts
+	strict := false
+	if sig, _ := f["sql_injection_signals"].([]string); len(sig) > 0 {
+		strict = true
+	}
+	if uf, _ := f["user_functions"].([]string); len(uf) > 0 {
+		strict = true
+	}
+	for _, k := range []string{"write_via_query", "copy_external", "schema_change", "opaque_code", "multi_statement"} {
+		if b, _ := f[k].(bool); b {
+			strict = true
+		}
+	}
+	if len(s.strictMemo) < 4096 {
+		s.strictMemo[si] = strict
+	}
+	return strict
 }

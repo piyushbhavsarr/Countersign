@@ -228,6 +228,10 @@ type session struct {
 	// captureReady: the session's capture table and setting are known to be in place;
 	// setupPending: they were made inside the current transaction (they hold if it commits)
 	captureReady bool
+	// strict: the open transaction takes the strict lane at COMMIT
+	strict       bool
+	strictMemo   map[*stmtInfo]bool
+	newShape     map[*stmtInfo]bool
 	decided      map[*stmtInfo]string // this session's decisions on statements it ran before (\"\" = allowed)
 	setupPending bool
 	internalSent bool                  // the gateway sent steps of its own in this batch
@@ -240,7 +244,7 @@ func newSession(g *Gateway, conn net.Conn, be *pgproto3.Backend, up *upstream, u
 	pid, key := randKey()
 	return &session{g: g, conn: conn, cl: be, up: up, user: user, readOnly: readOnly, target: target, pid: pid, key: key,
 		wake: make(chan struct{}, 1), stmts: map[string]*stmtInfo{}, portals: map[string]*stmtInfo{}, upStatus: 'I',
-		captureReady: true, decided: map[*stmtInfo]string{}} // every connection is set up when made, and again when pooled
+		captureReady: true, decided: map[*stmtInfo]string{}, strictMemo: map[*stmtInfo]bool{}, newShape: map[*stmtInfo]bool{}} // every connection is set up when made, and again when pooled
 }
 
 func (s *session) sendClient(msgs ...pgproto3.BackendMessage) error {
@@ -255,7 +259,9 @@ func (s *session) sendClient(msgs ...pgproto3.BackendMessage) error {
 // start finishes the client's startup: its session parameters are applied on the server,
 // and it is told the server's parameters and the gateway's own cancel key.
 func (s *session) start(params map[string]string) error {
-	var sets []string
+	// who the client is and the commit budget, for the fast lane's outbox and its guard
+	sets := []string{fmt.Sprintf("SELECT set_config('undolayer.user', %s, false), set_config('undolayer.max_rows', '%d', false), "+
+		"set_config('undolayer.max_fraction', '%g', false), set_config('undolayer.guard', %s, false)", lit(s.user), s.g.R.MaxRows, s.g.R.MaxFraction, lit(s.g.R.Mode))}
 	for k, v := range params {
 		switch k {
 		case "user", "database", "replication":

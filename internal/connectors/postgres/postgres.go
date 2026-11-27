@@ -234,7 +234,7 @@ func analyze(sql string) (model.Facts, error) {
 	}
 	stmts, _ := tree["stmts"].([]any)
 	f := model.Facts{"statements": len(stmts)}
-	others := false
+	others, capture := false, false
 	sigs := map[string]bool{}
 	if fp, err := pg_query.Fingerprint(sql); err == nil {
 		f["query_shape"] = fp
@@ -289,6 +289,9 @@ func analyze(sql string) (model.Facts, error) {
 			}
 			if sessionViews[name] {
 				others = true
+			}
+			if schema == "undolayer" {
+				capture = true
 			}
 		}
 		if kind, ok := dataNodes[k]; ok {
@@ -384,6 +387,13 @@ func analyze(sql string) (model.Facts, error) {
 	// what other sessions run and hold (through a gateway every client is the same database
 	// user, so these would show one client another's statements, with their values)
 	f["other_sessions"] = others
+	for _, fn := range fl {
+		if strings.HasPrefix(fn, "undolayer.") {
+			capture = true
+		}
+	}
+	// the capture schema: the outbox holds every gateway client's before states
+	f["touches_capture"] = capture
 	for _, fn := range fl {
 		base := fn[strings.LastIndex(fn, ".")+1:]
 		switch {

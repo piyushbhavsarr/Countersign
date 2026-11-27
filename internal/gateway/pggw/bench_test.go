@@ -3,6 +3,7 @@ package pggw
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -57,6 +58,10 @@ func TestThroughput(t *testing.T) {
 		return err
 	}
 	d := 3 * time.Second
+	if os.Getenv("CS_QUICK") != "" {
+		run(e.url, "gateway write", 1, d, write)
+		return
+	}
 	for _, w := range []int{1, 32} {
 		run(e.dsn, "direct read", w, d, read)
 		run(e.url, "through the gateway read", w, d, read)

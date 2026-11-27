@@ -87,3 +87,9 @@ id = "gw-other-sessions"
 when = { other_sessions = true }
 decision = "deny"
 reason = "through the gateway every client shares one database login, so this would show or act on other clients' sessions and their statements"
+
+[[rule]]
+id = "gw-capture-schema"
+when = { touches_capture = true }
+decision = "deny"
+reason = "the undolayer schema holds every client's before states; nothing reads or changes it through the gateway"

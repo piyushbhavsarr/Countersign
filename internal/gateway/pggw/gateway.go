@@ -73,6 +73,17 @@ type Route struct {
 	// MaxCaptureRows: a transaction changing more rows than this is refused at COMMIT, since
 	// its before state would not fit the vault in one go (default 1,000,000).
 	MaxCaptureRows int `toml:"max_capture_rows"`
+	// Lane: fast (default) commits ordinary writes without waiting for the vault: their
+	// before state is written in the same transaction, to the database's own outbox, and
+	// moved to the vault in the background, while the database holds the commit budget
+	// (max_rows, max_fraction, a primary key) itself. Suspicious statements always take
+	// the strict lane: the before state is in the vault on a quorum before COMMIT goes on.
+	// strict sends every write that way.
+	Lane string `toml:"lane"`
+	// MaxRows and MaxFraction: the commit budget the database holds in the fast lane
+	// (default 100,000 rows, and half of a table of more than 1,000 changed rows).
+	MaxRows     int     `toml:"max_rows"`
+	MaxFraction float64 `toml:"max_fraction"`
 	// PoolSize: idle server connections kept per server for reuse (default 16).
 	PoolSize int `toml:"pool_size"`
 }
@@ -93,12 +104,14 @@ type Gateway struct {
 	sessMu   sync.Mutex
 	sessions map[uint32]*session
 
-	analyze *stmtCache
-	pk      *pkCache
-	shapes  shapeSet
-	bg      sync.WaitGroup // background vault writes
-	stats   gwStats
-	closed  atomic.Bool
+	analyze   *stmtCache
+	pk        *pkCache
+	shapes    shapeSet
+	bg        sync.WaitGroup // background vault writes
+	stats     gwStats
+	closed    atomic.Bool
+	drain     *drainer
+	drainOnce sync.Once
 }
 
 type gwStats struct {
@@ -115,6 +128,18 @@ func New(r Route, m *tx.Manager) (*Gateway, error) {
 	}
 	if r.Mode != "enforce" && r.Mode != "watch" {
 		return nil, fmt.Errorf("[[pg_gateway]] %s: mode is enforce or watch", r.Name)
+	}
+	if r.Lane == "" {
+		r.Lane = "fast"
+	}
+	if r.Lane != "fast" && r.Lane != "strict" {
+		return nil, fmt.Errorf("[[pg_gateway]] %s: lane is fast or strict", r.Name)
+	}
+	if r.MaxRows <= 0 {
+		r.MaxRows = 100_000
+	}
+	if r.MaxFraction <= 0 {
+		r.MaxFraction = 0.5
 	}
 	if r.MaxCaptureRows <= 0 {
 		r.MaxCaptureRows = 1_000_000
@@ -195,6 +220,7 @@ func (g *Gateway) checkInstalled() error {
 // Serve accepts connections until l is closed.
 func (g *Gateway) Serve(l net.Listener) error {
 	go g.topo.run()
+	g.drainOnce.Do(g.startDrainer)
 	defer g.topo.stop()
 	for {
 		c, err := l.Accept()
@@ -213,6 +239,7 @@ func (g *Gateway) Serve(l net.Listener) error {
 func (g *Gateway) Close() {
 	g.closed.Store(true)
 	g.bg.Wait()
+	_ = g.Drain() // what committed last goes to the vault too
 	if g.M.Vault != nil {
 		_ = g.M.Vault.Flush()
 	}
@@ -458,8 +485,7 @@ func dial(dsn string) (*upstream, error) {
 
 // captureSetup makes a session capture. It is run when the connection is made and again
 // before each transaction that writes (DISCARD ALL or RESET by a client would undo it).
-const captureSetup = `CREATE TEMP TABLE IF NOT EXISTS undolayer_log(seq bigserial PRIMARY KEY, tbl text, op text,
-  old_row jsonb, new_row jsonb) ON COMMIT DELETE ROWS; SELECT set_config('undolayer.tx', 'gateway', false)`
+const captureSetup = `SELECT set_config('undolayer.tx', 'gateway', false)`
 
 func (u *upstream) close() { _ = u.conn.Close() }
 
@@ -693,7 +719,9 @@ func (t *topology) isPrimary(dsn string) bool {
 
 // waitBG waits for the background vault writes (tests, shutdown).
 func (g *Gateway) waitBG() error {
-	g.bg.Wait()
+	if err := g.Drain(); err != nil {
+		return err
+	}
 	if g.M.Vault != nil {
 		return g.M.Vault.Flush()
 	}

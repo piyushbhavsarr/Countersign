@@ -60,6 +60,10 @@ func setup(t *testing.T, mod func(*Route)) *env {
 		t.Fatal(err)
 	}
 	d := t.TempDir()
+	if vd := os.Getenv("UNDOLAYER_TEST_VAULT_DIR"); vd != "" { // the vault on its own disk, as in production
+		d, _ = os.MkdirTemp(vd, "v")
+		t.Cleanup(func() { os.RemoveAll(d) })
+	}
 	m, err := tx.NewManager(filepath.Join(d, "state"), policy.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +173,9 @@ func TestReadsWritesAndUndo(t *testing.T) {
 			t.Fatal("rollback did not hold")
 		}
 		before := e.scalar(t, "SELECT balance::text FROM accounts WHERE id = 7")
-		// find the gateway transactions in the vault and undo the delete+insert one
+		// find the gateway transactions in the vault (the fast lane's arrive in the
+		// background, moments after their commit) and undo the delete+insert one
+		_ = e.gw.waitBG()
 		bs, _, err := e.v.Batches(func(r *vault.Record) bool { return r.Phase == "intent" })
 		if err != nil {
 			t.Fatal(err)
@@ -187,6 +193,10 @@ func TestReadsWritesAndUndo(t *testing.T) {
 		}
 		_ = e.gw.waitBG()
 		if rep, err := e.m.UndoFromVault(del); err != nil || !rep.Clean() {
+			crs, _ := e.m.ChangedRows(del)
+			for _, c := range crs {
+				t.Logf("cr: settled=%q undone=%v rec=%d source=%s", c.Settled, c.Undone, len(c.Record), c.Source)
+			}
 			t.Fatalf("undo: %v %+v", err, rep)
 		}
 		if e.scalar(t, "SELECT count(*)::text FROM accounts WHERE id = 8") != "1" || e.scalar(t, "SELECT count(*)::text FROM accounts WHERE id = 100000") != "0" {
@@ -217,7 +227,8 @@ func TestRefusalsBehaveLikeServerErrors(t *testing.T) {
 		}
 		// clients share the gateway's login: other sessions' statements stay out of sight
 		for _, q := range []string{"SELECT query FROM pg_stat_activity", "SELECT pg_terminate_backend(1)",
-			"SELECT * FROM pg_catalog.pg_locks"} {
+			"SELECT * FROM pg_catalog.pg_locks", "SELECT * FROM undolayer.outbox", "DELETE FROM undolayer.outbox",
+			"SELECT undolayer.refuse('x', '42501')"} {
 			if _, err := c.Exec(ctx, q); !strings.Contains(fmt.Sprint(err), "refused by Countersign") {
 				t.Fatalf("simple=%v %s was not refused: %v", simple, q, err)
 			}
