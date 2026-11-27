@@ -127,6 +127,41 @@ decision = "deny"
 reason = "The agent may not set its own headers (credentials are injected by the gateway)"
 
 [[rule]]
+id = "http-metadata-service"
+connector = "http"
+when = { destination_network = "metadata" }
+decision = "deny"
+reason = "Cloud metadata services (169.254.169.254, metadata.google.internal, ...) hand out the machine's own credentials"
+
+[[rule]]
+id = "http-private-network"
+connector = "http"
+when = { destination_network = { in = ["loopback", "link_local", "private"] }, destination_private_allowed = false }
+decision = "deny"
+reason = "The address is on this machine or a private network (SSRF); the operator can allow a host in [http] allow_private_hosts"
+
+[[rule]]
+id = "http-scheme"
+connector = "http"
+when = { url_scheme = { in = ["file", "gopher", "ftp", "dict", "ldap", "jar", "data", "invalid", ""] } }
+decision = "deny"
+reason = "Only http and https URLs are sent"
+
+[[rule]]
+id = "http-userinfo"
+connector = "http"
+when = { url_userinfo = true }
+decision = "deny"
+reason = "Credentials written into a URL (user:password@host) are not passed on; use a delegated credential"
+
+[[rule]]
+id = "http-header-injection"
+connector = "http"
+when = { header_injection = true }
+decision = "deny"
+reason = "A line break in the URL or a header would let the request carry headers or requests of its own"
+
+[[rule]]
 id = "http-undeclared-host"
 connector = "http"
 when = { host_allowed = false }

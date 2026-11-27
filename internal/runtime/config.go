@@ -79,8 +79,11 @@ type Config struct {
 	} `toml:"registry"`
 	Credentials map[string]creds.Spec `toml:"credentials"`
 	HTTP        struct {
-		AllowHosts     []string `toml:"allow_hosts"`
-		AllowedHeaders []string `toml:"allowed_headers"`
+		AllowHosts []string `toml:"allow_hosts"`
+		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
+		// networks. Cloud metadata services are refused regardless.
+		AllowPrivateHosts []string `toml:"allow_private_hosts"`
+		AllowedHeaders    []string `toml:"allowed_headers"`
 	} `toml:"http"`
 	Effects struct {
 		OrgDomains    []string           `toml:"org_domains"`
@@ -376,7 +379,7 @@ registry:
 	}
 	m.Register(ef)
 	h := effects.NewHTTP(store, nil)
-	h.AllowHosts = c.HTTP.AllowHosts
+	h.AllowHosts, h.AllowPrivateHosts = c.HTTP.AllowHosts, c.HTTP.AllowPrivateHosts
 	if len(c.HTTP.AllowedHeaders) > 0 {
 		h.AllowedHeaders = c.HTTP.AllowedHeaders
 	}
