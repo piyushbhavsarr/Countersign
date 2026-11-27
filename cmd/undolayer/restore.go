@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"undolayer/internal/connectors/mcpproxy"
+	"undolayer/internal/gateway/mongogw"
 	"undolayer/internal/gateway/pggw"
 	"undolayer/internal/model"
 	rt "undolayer/internal/runtime"
@@ -678,31 +679,46 @@ func mcpCmd(m *tx.Manager, args []string) {
 
 func printJSON(v any) { out(v) }
 
-// undolayer gateway: serve every [[pg_gateway]] until SIGINT or SIGTERM, then finish the
-// vault and audit writes in flight.
+// undolayer gateway: serve every [[pg_gateway]] and [[mongo_gateway]] until SIGINT or
+// SIGTERM, then finish the vault and audit writes in flight.
 func gatewayCmd(c *rt.Config, m *tx.Manager) {
-	if len(c.PGGateways) == 0 {
-		die(errors.New("no [[pg_gateway]] in the configuration"))
+	if len(c.PGGateways) == 0 && len(c.MongoGateways) == 0 {
+		die(errors.New("no [[pg_gateway]] or [[mongo_gateway]] in the configuration"))
 	}
-	var gws []*pggw.Gateway
+	type server interface {
+		Serve(net.Listener) error
+		Close()
+	}
+	var gws []server
 	var ls []net.Listener
+	start := func(kind, name, listen, target, mode string, g server) {
+		l, err := net.Listen("tcp", listen)
+		if err != nil {
+			die(fmt.Errorf("[[%s]] %s: %v", kind, name, err))
+		}
+		fmt.Fprintf(os.Stderr, "countersign gateway %s: %s -> %s (%s)\n", name, l.Addr(), redactDSN(target), mode)
+		gws, ls = append(gws, g), append(ls, l)
+		go func() {
+			if err := g.Serve(l); err != nil {
+				fmt.Fprintln(os.Stderr, "gateway:", err)
+			}
+		}()
+	}
 	for _, r := range c.PGGateways {
 		g, err := pggw.New(r, m)
 		if err != nil {
 			die(err)
 		}
 		m.Register(g.Conn)
-		l, err := net.Listen("tcp", r.Listen)
+		start("pg_gateway", r.Name, r.Listen, r.Primary, g.R.Mode, g)
+	}
+	for _, r := range c.MongoGateways {
+		g, err := mongogw.New(r, m)
 		if err != nil {
-			die(fmt.Errorf("[[pg_gateway]] %s: %v", r.Name, err))
+			die(err)
 		}
-		fmt.Fprintf(os.Stderr, "countersign gateway %s: %s -> %s (%s)\n", r.Name, l.Addr(), redactDSN(r.Primary), g.R.Mode)
-		gws, ls = append(gws, g), append(ls, l)
-		go func(g *pggw.Gateway, l net.Listener) {
-			if err := g.Serve(l); err != nil {
-				fmt.Fprintln(os.Stderr, "gateway:", err)
-			}
-		}(g, l)
+		m.Register(g.Conn)
+		start("mongo_gateway", r.Name, r.Listen, r.URI, g.R.Mode, g)
 	}
 	stop := make(chan struct{})
 	if m.Vault != nil {

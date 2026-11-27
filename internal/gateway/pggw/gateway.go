@@ -40,6 +40,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"undolayer/internal/connectors/postgres"
+	"undolayer/internal/gateway/scram"
 	"undolayer/internal/policy"
 	"undolayer/internal/tx"
 )
@@ -83,7 +84,7 @@ type Gateway struct {
 	Conn   *postgres.Connector // the hidden connector undo and restore use
 	pol    *policy.Policy
 	tlsCfg *tls.Config
-	users  map[string]*scramVerifier
+	users  map[string]*scram.Verifier
 	maxLag time.Duration
 
 	topo  *topology
@@ -121,7 +122,7 @@ func New(r Route, m *tx.Manager) (*Gateway, error) {
 	if r.PoolSize <= 0 {
 		r.PoolSize = 16
 	}
-	g := &Gateway{R: r, M: m, sessions: map[uint32]*session{}, users: map[string]*scramVerifier{},
+	g := &Gateway{R: r, M: m, sessions: map[uint32]*session{}, users: map[string]*scram.Verifier{},
 		analyze: &stmtCache{m: map[string]*stmtInfo{}}, pk: &pkCache{m: map[string]pkEntry{}}, maxLag: 10 * time.Second,
 		shapes: shapeSet{m: map[string]bool{}}}
 	if r.MaxReplicaLag != "" {
@@ -140,7 +141,7 @@ func New(r Route, m *tx.Manager) (*Gateway, error) {
 		return nil, fmt.Errorf("[[pg_gateway]] %s: list users (and passwords), or set trust on a loopback address", r.Name)
 	}
 	for u, p := range r.Users {
-		v, err := newVerifier(p)
+		v, err := scram.NewVerifier(p)
 		if err != nil {
 			return nil, err
 		}
@@ -313,7 +314,7 @@ func (g *Gateway) authenticate(be *pgproto3.Backend, user string) error {
 	}
 	v := g.users[user]
 	if v == nil { // run the exchange anyway, so a missing user looks like a wrong password
-		v, _ = newVerifier(string(randBytes(16)))
+		v, _ = scram.NewVerifier(string(randBytes(16)))
 	}
 	be.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
 	if err := be.Flush(); err != nil {
@@ -330,8 +331,8 @@ func (g *Gateway) authenticate(be *pgproto3.Backend, user string) error {
 	if !ok || init.AuthMechanism != "SCRAM-SHA-256" {
 		return errors.New("expected SCRAM-SHA-256")
 	}
-	ss := &scramServer{v: v}
-	sf, err := ss.first(string(init.Data))
+	ss := &scram.Server{V: v}
+	sf, err := ss.First(string(init.Data))
 	if err != nil {
 		return err
 	}
@@ -350,7 +351,7 @@ func (g *Gateway) authenticate(be *pgproto3.Backend, user string) error {
 	if !ok {
 		return errors.New("expected a SASL response")
 	}
-	fin, err := ss.final(string(resp.Data))
+	fin, err := ss.Final(string(resp.Data))
 	if err != nil || g.users[user] == nil {
 		return errors.New("password authentication failed for user " + user)
 	}

@@ -33,10 +33,12 @@ import (
 	gitc "undolayer/internal/connectors/git"
 	"undolayer/internal/connectors/kube"
 	"undolayer/internal/connectors/mcpproxy"
+	mongoconn "undolayer/internal/connectors/mongo"
 	"undolayer/internal/connectors/postgres"
 	"undolayer/internal/connectors/sqlite"
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
+	"undolayer/internal/gateway/mongogw"
 	"undolayer/internal/gateway/pggw"
 	"undolayer/internal/policy"
 	"undolayer/internal/registry"
@@ -85,7 +87,9 @@ type Config struct {
 	// [[pg_gateway]]: Countersign in front of a PostgreSQL database, speaking its protocol
 	// (served by undolayer gateway). Its transactions can be undone and restored like any.
 	PGGateways []pggw.Route `toml:"pg_gateway"`
-	HTTP       struct {
+	// [[mongo_gateway]]: Countersign in front of MongoDB, speaking its wire protocol
+	MongoGateways []mongogw.Route `toml:"mongo_gateway"`
+	HTTP          struct {
 		AllowHosts []string `toml:"allow_hosts"`
 		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
 		// networks. Cloud metadata services are refused regardless.
@@ -534,6 +538,9 @@ registry:
 		pc := postgres.New(r.Primary)
 		pc.ConnName, pc.Hide = "gw-"+r.Name, true
 		m.Register(pc)
+	}
+	for _, r := range c.MongoGateways {
+		m.Register(mongoconn.New("gw-"+r.Name, r.URI))
 	}
 	for _, sv := range c.MCPServers {
 		if _, err := m.Connector(sv.Name); err == nil {

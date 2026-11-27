@@ -266,7 +266,7 @@ mode = "enforce"                                            # or "watch": refuse
 
 ```sh
 undolayer pg install -c undolayer.toml    # once per database: row capture and the refusal function
-undolayer gateway -c undolayer.toml
+undolayer gateway -c undolayer.toml      # serves every [[pg_gateway]] and [[mongo_gateway]]
 ```
 
 - **Protect.** Each statement is checked from PostgreSQL's own parse tree: injection signs, query shape, and what it touches. The result is cached by statement text. Sessions go to the main database or to a replica that isn't lagging, and the gateway follows a failover. If two servers both claim to be the main database, writes are refused.
@@ -274,6 +274,29 @@ undolayer gateway -c undolayer.toml
 - **Undo.** Rows are captured as statements run. Before the COMMIT is passed on, every changed row's before state is stored in the vault on a majority of replicas. With no quorum there is no commit. `changes`, `restore`, `revert` and `undo` work on gateway transactions; their ids are in the audit chain as `gateway_commit` events.
 
 Reads pay a cached decision and a relay. Writes pay one extra round trip at COMMIT and a vault write, shared with every other commit in flight.
+
+### Put it in front of MongoDB
+
+The same three steps for MongoDB, at its wire protocol. Drivers connect to Countersign as they would to a `mongos` router.
+
+```toml
+[[mongo_gateway]]
+name = "docs"
+listen = "127.0.0.1:27018"
+uri = "mongodb://countersign:...@db1:27017/?authSource=admin"   # the primary or a mongos
+users = { app = "app-password" }                                # SCRAM-SHA-256
+mode = "enforce"
+```
+
+- **Protect.** Each command is checked before it runs. Server-side JavaScript (`$where`, `$function`, `$accumulator`, mapReduce) is how injected input becomes code. Other checks: `$out` and `$merge`, dropping or renaming collections and databases, user and role changes, server administration, and writes to `admin`, `config`, `local` or `system.*`.
+- **Block.** A refused command gets an ordinary MongoDB error (code 13, "refused by Countersign: ..."). A write is checked again before it commits, on how many documents it actually changed and what share of the collection that is.
+- **Undo.** Every write runs in a transaction.
+  - Inside it, the gateway reads the documents the write will change and narrows the write to exactly those `_id`s. It then reads them again afterwards.
+  - Both states are stored in the vault as canonical Extended JSON, so every BSON type is kept exactly. This happens before the commit.
+  - A client's own transactions are stored when the client commits them.
+  - Undo puts each document back in one transaction, and only if it is still as the write left it.
+
+  The server must be a replica set member or a `mongos`. On a standalone server, writes are refused in enforce mode.
 
 ### Put other MCP servers behind it
 

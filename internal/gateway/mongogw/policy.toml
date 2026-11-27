@@ -1,0 +1,71 @@
+# Countersign MongoDB gateway policy: for an application's (or agent's) own traffic.
+# Each command is judged from what it is (server_js, aggregation_write, destroys_data,
+# privilege_change, admin_command, system_namespace, unsupported_write); a write is judged
+# again before it commits, on what it actually changed (docs_affected, docs_deleted,
+# collection_fraction_changed, collections_touched). deny and require_approval both refuse
+# (an application cannot wait for a person); mode = "watch" audits them instead.
+
+[settings]
+hold_irreversible = false
+require_approval_for_commit = false
+redact_results = false
+
+[budget]
+max_rows_changed = 0
+max_table_fraction_changed = 0
+
+[[rule]]
+id = "gw-server-js"
+when = { server_js = true }
+decision = "deny"
+reason = "$where, $function, $accumulator and mapReduce run JavaScript on the server: the NoSQL way injected input becomes code"
+
+[[rule]]
+id = "gw-aggregation-write"
+when = { aggregation_write = true }
+decision = "deny"
+reason = "$out and $merge replace or rewrite collections from a pipeline; the gateway cannot keep their before state"
+
+[[rule]]
+id = "gw-destroys-data"
+when = { destroys_data = true }
+decision = "deny"
+reason = "dropping or renaming a collection or database destroys data outright; run it through a reviewed migration"
+
+[[rule]]
+id = "gw-privileges"
+when = { privilege_change = true }
+decision = "deny"
+reason = "creating, changing or granting users and roles is not done through this gateway"
+
+[[rule]]
+id = "gw-admin"
+when = { admin_command = true }
+decision = "deny"
+reason = "server administration (shutdown, parameters, replication, applyOps, ...) is not done through this gateway"
+
+[[rule]]
+id = "gw-system-namespace"
+when = { system_namespace = true }
+decision = "deny"
+reason = "writes to the admin, config and local databases and to system collections are not done through this gateway"
+
+[[rule]]
+id = "gw-unsupported-write"
+when = { unsupported_write = true }
+decision = "deny"
+reason = "this kind of write cannot be captured exactly (use insert, update, delete and findAndModify)"
+
+[[rule]]
+id = "gw-mass-change"
+operation = ["commit"]
+when = { docs_affected = { gt = 100000 } }
+decision = "deny"
+reason = "the write changes more than 100,000 documents"
+
+[[rule]]
+id = "gw-collection-fraction"
+operation = ["commit"]
+when = { collection_fraction_changed = { gt = 0.5 }, docs_affected = { gt = 1000 } }
+decision = "deny"
+reason = "the write changes over half of a collection"
