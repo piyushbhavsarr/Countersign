@@ -108,10 +108,10 @@ func main() {
 		if err := integrations.Hook(os.Stdin, os.Stdout, cfg); err != nil {
 			die(err)
 		}
-	case "aws":
+	case "aws", "azure", "gcp":
 		parseArgs(fs, args)
 		if fs.Arg(0) != "verify" || fs.Arg(1) == "" {
-			die(errors.New("usage: undolayer aws verify <AWS::Type> --desired '<properties JSON>' --patch '<JSON Patch>' -c undolayer.toml\n" +
+			die(errors.New("usage: undolayer aws|azure|gcp verify <type> --desired '<properties JSON>' --patch '<JSON Patch>' -c undolayer.toml\n" +
 				"  Creates a resource of that type in your account, updates it, undoes the update, checks the properties\n" +
 				"  are back, and deletes it. Use a sandbox account. On success the type's changes become undoable."))
 		}
@@ -132,9 +132,10 @@ func main() {
 			die(errors.New("both --desired and --patch are required"))
 		}
 		_, m := load(*cfgPath)
-		c, err := m.Connector("cloud")
+		name := map[string]string{"aws": "cloud", "azure": "azure", "gcp": "gcp"}[cmd]
+		c, err := m.Connector(name)
 		if err != nil {
-			die(err)
+			die(fmt.Errorf("[%s] is not configured", cmd))
 		}
 		cl := c.(*cloud.Connector)
 		if cl.CC == nil {

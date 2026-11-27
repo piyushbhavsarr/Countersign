@@ -104,6 +104,26 @@ type Config struct {
 		// how long a resource create/update/delete may take before it is reported as stuck
 		ResourceTimeout string `toml:"resource_timeout"`
 	} `toml:"aws"`
+	// [azure]: Azure Resource Manager resources (the "azure" connector). Enabled when
+	// subscription or api_versions is set. Tokens come from `az account get-access-token`
+	// unless token_command says otherwise; the credential's own Azure roles decide what it may do.
+	Azure struct {
+		Subscription    string              `toml:"subscription"`
+		BaseURL         string              `toml:"base_url"`
+		TokenCommand    []string            `toml:"token_command"`
+		APIVersions     map[string]string   `toml:"api_versions"`
+		WriteOnly       map[string][]string `toml:"write_only"`
+		PutTypes        []string            `toml:"put_types"`
+		ResourceTimeout string              `toml:"resource_timeout"`
+	} `toml:"azure"`
+	// [gcp]: Google Cloud resources (the "gcp" connector), one [gcp.types."<service>/<Kind>"]
+	// per type to manage. Tokens come from `gcloud auth print-access-token` unless
+	// token_command says otherwise.
+	GCP struct {
+		TokenCommand    []string                 `toml:"token_command"`
+		Types           map[string]cloud.GCPType `toml:"types"`
+		ResourceTimeout string                   `toml:"resource_timeout"`
+	} `toml:"gcp"`
 	Kubernetes struct {
 		Context     string `toml:"context"`     // kubeconfig context; the connector is enabled when set
 		Kubeconfig  string `toml:"kubeconfig"`  // default: kubectl's own ($KUBECONFIG, ~/.kube/config)
@@ -411,6 +431,49 @@ registry:
 		cl.EnableResources(to)
 	}
 	m.Register(cl)
+	timeout := func(s, section string) (time.Duration, error) {
+		if s == "" {
+			return 30 * time.Minute, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("[%s] resource_timeout: %w", section, err)
+		}
+		return d, nil
+	}
+	if az := c.Azure; az.Subscription != "" || len(az.APIVersions) > 0 {
+		to, err := timeout(az.ResourceTimeout, "azure")
+		if err != nil {
+			return nil, nil, err
+		}
+		arm := cloud.NewARM(az.BaseURL, az.Subscription, az.TokenCommand, to)
+		for k, v := range az.APIVersions {
+			arm.APIVersions[k] = v
+		}
+		for k, v := range az.WriteOnly {
+			arm.WriteOnly[k] = v
+		}
+		for _, t := range az.PutTypes {
+			arm.PutTypes[t] = true
+		}
+		ac := cloud.NewResources("azure", c.StateDir, arm)
+		ac.Shared = m.Store
+		m.Register(ac)
+	}
+	if g := c.GCP; len(g.Types) > 0 {
+		to, err := timeout(g.ResourceTimeout, "gcp")
+		if err != nil {
+			return nil, nil, err
+		}
+		for name, t := range g.Types {
+			if t.Collection == "" || (t.Update != "mask" && t.Update != "merge" && t.Update != "put") {
+				return nil, nil, fmt.Errorf("[gcp.types.%q]: collection and update (mask, merge or put) are required", name)
+			}
+		}
+		gc := cloud.NewResources("gcp", c.StateDir, cloud.NewGCP(g.Types, g.TokenCommand, to))
+		gc.Shared = m.Store
+		m.Register(gc)
+	}
 	if k := c.Kubernetes; k.Context != "" {
 		kc := kube.New()
 		kc.Context, kc.Environment = k.Context, k.Environment

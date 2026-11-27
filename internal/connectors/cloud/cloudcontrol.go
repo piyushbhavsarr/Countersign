@@ -78,14 +78,17 @@ type Resources interface {
 // ---------------------------------------------------------------- schema pointers
 
 // pointer turns a patch path or a property path into schema-pointer segments.
+// segments splits a schema pointer: schemas point at a resource's properties as
+// /properties/<name>/..., and documents hold them at the top level.
 func segments(p string) []string {
 	p = strings.TrimPrefix(p, "/properties")
 	return strings.Split(strings.Trim(p, "/"), "/")
 }
 
-// touches: does a change at path p affect the schema pointer sp (either contains the other)?
+// touches: does a change at path p (a JSON Patch path into the document) affect the schema
+// pointer sp (either contains the other)?
 func touches(p, sp string) bool {
-	a, b := segments(p), segments(sp)
+	a, b := strings.Split(strings.Trim(p, "/"), "/"), segments(sp)
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -141,14 +144,14 @@ func (s *Schema) readOnlyFree(props map[string]any) map[string]any {
 func (s *Schema) validateCreate(desired map[string]any) error {
 	var problems []string
 	for k := range desired {
-		if _, ok := s.Properties[k]; !ok {
+		if _, ok := s.Properties[k]; !ok && (s.AdditionalOK == nil || !*s.AdditionalOK) {
 			problems = append(problems, k+" is not a property of "+s.TypeName)
 		}
 	}
 	for _, ro := range s.ReadOnly {
 		if segs := segments(ro); len(segs) == 1 {
 			if _, ok := desired[segs[0]]; ok {
-				problems = append(problems, segs[0]+" is read-only (AWS sets it)")
+				problems = append(problems, segs[0]+" is read-only (the cloud sets it)")
 			}
 		}
 	}
@@ -202,11 +205,18 @@ type SharedDocs interface {
 	Put(name string, b []byte) error
 }
 
-func (c *Connector) verifiedFile() string { return filepath.Join(c.StateDir, "aws-verified.json") }
+func (c *Connector) verifiedName() string {
+	if c.Provider == "" || c.Provider == "aws" {
+		return "aws-verified.json"
+	}
+	return c.Provider + "-verified.json"
+}
+
+func (c *Connector) verifiedFile() string { return filepath.Join(c.StateDir, c.verifiedName()) }
 
 func (c *Connector) readVerified() ([]byte, error) {
 	if c.Shared != nil {
-		return c.Shared.Get("aws-verified.json")
+		return c.Shared.Get(c.verifiedName())
 	}
 	return os.ReadFile(c.verifiedFile())
 }
@@ -229,7 +239,7 @@ func (c *Connector) markVerified(s *Schema) error {
 	v[s.TypeName] = s.Digest
 	b, _ := json.MarshalIndent(v, "", " ")
 	if c.Shared != nil {
-		return c.Shared.Put("aws-verified.json", b)
+		return c.Shared.Put(c.verifiedName(), b)
 	}
 	return os.WriteFile(c.verifiedFile(), b, 0o600)
 }
@@ -273,6 +283,20 @@ func (c *Connector) classifyCC(t *tx.Tx, op string, args map[string]any) (model.
 		return "", nil, err
 	}
 	f["undo_verified"] = c.isVerified(sch)
+	if ex := exposure(args["desired_state"], "", nil); len(ex) > 0 {
+		f["public_exposure"] = ex
+	}
+	if ps, ok := args["patch"].([]any); ok {
+		var ex []string
+		for _, p := range ps {
+			if m, ok := p.(map[string]any); ok {
+				ex = exposure(m["value"], str(m["path"]), ex)
+			}
+		}
+		if len(ex) > 0 {
+			f["public_exposure"] = ex
+		}
+	}
 	switch op {
 	case "resource_delete":
 		f["destroys_resource"] = true
@@ -343,6 +367,22 @@ func (c *Connector) stageCC(t *tx.Tx, a *model.Action) (any, error) {
 			return nil, fmt.Errorf("%s %s does not exist", typ, ch.ID)
 		}
 		patch, _ := json.Marshal(a.Args["patch"])
+		// a property the cloud does not return (a password, a key) has no old value to put
+		// back: replacing or removing one cannot be undone
+		var ops []patchOp
+		_ = json.Unmarshal(patch, &ops)
+		var hidden []string
+		for _, o := range ops {
+			if o.Op == "replace" || o.Op == "remove" {
+				if _, ok := threeway.Get(before, pathOf(o.Path)); !ok {
+					hidden = append(hidden, o.Path)
+				}
+			}
+		}
+		if len(hidden) > 0 && a.Effect != model.Irreversible {
+			return nil, &model.Defer{Facts: model.Facts{"changes_write_only": hidden},
+				Reason: "the cloud does not return " + strings.Join(hidden, ", ") + ", so its old value cannot be put back"}
+		}
 		exp, err := applyPatch(before, patch)
 		if err != nil {
 			return nil, fmt.Errorf("the patch does not apply to %s %s: %v", typ, ch.ID, err)
@@ -358,6 +398,20 @@ func (c *Connector) stageCC(t *tx.Tx, a *model.Action) (any, error) {
 // may read is metadata; what only the read profile may read is data, and its values are
 // treated as secret (a function's environment variables, a connection string, ...).
 func (c *Connector) readCC(t *tx.Tx, a *model.Action, action string, params map[string]any) (any, error) {
+	if c.Provider != "" && c.Provider != "aws" { // the credential's own permissions decide
+		typ, id := str(params["TypeName"]), str(params["Identifier"])
+		if action == "ListResources" {
+			return c.CC.List(typ)
+		}
+		props, err := c.CC.Get(typ, id)
+		if err != nil {
+			return nil, err
+		}
+		if props == nil {
+			return nil, fmt.Errorf("%s %s does not exist", typ, id)
+		}
+		return map[string]any{"type": typ, "identifier": id, "properties": props}, nil
+	}
 	if c.ReadProfile == "" {
 		return nil, errors.New("AWS resources need [aws] profiles")
 	}
@@ -904,6 +958,57 @@ func uniqStrings(l []string) []string {
 	for i, s := range l {
 		if i == 0 || s != l[i-1] {
 			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// pathOf turns a JSON pointer into a threeway path.
+func pathOf(ptr string) threeway.Path {
+	var p threeway.Path
+	for _, seg := range strings.Split(strings.TrimPrefix(ptr, "/"), "/") {
+		seg = strings.ReplaceAll(strings.ReplaceAll(seg, "~1", "/"), "~0", "~")
+		if isIndex(seg) && seg != "-" {
+			n := 0
+			fmt.Sscan(seg, &n)
+			p = append(p, n)
+		} else {
+			p = append(p, seg)
+		}
+	}
+	return p
+}
+
+// exposure finds settings that open a resource to the whole internet, on any cloud: an
+// address range of everything (0.0.0.0/0, ::/0), a source of * or Internet, or a property
+// about public access turned on. It reports where each is.
+func exposure(v any, at string, out []string) []string {
+	key := strings.ToLower(at[strings.LastIndex(at, "/")+1:])
+	switch x := v.(type) {
+	case map[string]any:
+		for k, e := range x {
+			out = exposure(e, at+"/"+k, out)
+		}
+	case []any:
+		for i, e := range x {
+			out = exposure(e, fmt.Sprintf("%s/%d", at, i), out)
+		}
+		if len(x) > 0 {
+			return out
+		}
+	case string:
+		l := strings.ToLower(x)
+		switch {
+		case l == "0.0.0.0/0" || l == "::/0":
+			out = append(out, at+" = "+x)
+		case (l == "*" || l == "internet") && strings.Contains(key, "source"):
+			out = append(out, at+" = "+x)
+		case strings.Contains(key, "public") && (l == "enabled" || l == "allow" || l == "true"):
+			out = append(out, at+" = "+x)
+		}
+	case bool:
+		if x && strings.Contains(key, "public") && !strings.Contains(key, "block") && !strings.Contains(key, "prevent") {
+			out = append(out, at+" = true")
 		}
 	}
 	return out

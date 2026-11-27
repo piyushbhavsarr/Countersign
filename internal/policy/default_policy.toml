@@ -168,6 +168,13 @@ when = { host_allowed = false }
 decision = "deny"
 reason = "Host is not covered by any delegated credential or allow-list"
 
+# ---------------------------------------------------------------- Cloud resources (AWS, Azure, Google Cloud)
+[[rule]]
+id = "cloud-public-exposure"
+when = { public_exposure = { exists = true, ne = [] } }
+decision = "require_approval"
+reason = "This opens the resource to the whole internet (0.0.0.0/0, a * or Internet source, or public access turned on)"
+
 # ---------------------------------------------------------------- Tools on other MCP servers
 [[rule]]
 id = "mcp-tool-changed"
