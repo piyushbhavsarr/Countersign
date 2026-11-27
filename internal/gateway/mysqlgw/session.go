@@ -43,8 +43,8 @@ func (g *Gateway) handle(c net.Conn) {
 		g.M.Audit.Note("gateway_upstream_failed", map[string]any{"gateway": g.R.Name, "error": err.Error()})
 		return
 	}
-	defer up.Close()
 	s := &session{g: g, up: up, autocommit: true, logs: map[string]bool{}, temps: map[string]bool{}, decided: map[*stmtInfo]string{}}
+	defer func() { s.up.Close() }()
 	if err := s.setup(); err != nil {
 		g.M.Audit.Note("gateway_upstream_failed", map[string]any{"gateway": g.R.Name, "error": err.Error()})
 		return
@@ -130,6 +130,20 @@ func (s *session) HandleStmtClose(ctx any) error {
 }
 
 func (s *session) HandleOtherCommand(cmd byte, data []byte) error {
+	if cmd == gomysql.COM_RESET_CONNECTION {
+		// connection pools reset a connection between uses: the server would drop the
+		// session's temporary tables (capture with them), so the gateway starts the session
+		// over on a fresh connection, capture in place, as a reset leaves it
+		up, err := mysql.Dial(s.g.A, s.up.GetDB())
+		if err != nil {
+			return err
+		}
+		_ = s.up.Close() // rolls back anything open, as a reset does
+		s.up = up
+		s.end()
+		s.temps, s.logs, s.autocommit = map[string]bool{}, map[string]bool{}, true
+		return s.setup()
+	}
 	return gomysql.NewError(gomysql.ER_UNKNOWN_ERROR, fmt.Sprintf("command %d is not supported through the Countersign gateway", cmd))
 }
 
@@ -152,7 +166,7 @@ func (s *session) decide(si *stmtInfo) string {
 	if si.kind == kWrite {
 		eff, op = model.Reversible, "execute"
 	}
-	why := s.g.judge(s.user, &model.Action{Connector: "sql", Operation: op, Effect: eff, Facts: f}, si.text)
+	why := s.g.judge(s.user, &model.Action{Connector: "sql", Operation: op, Effect: eff, Facts: f}, si.norm)
 	if len(s.decided) < 4096 {
 		s.decided[si] = why
 	}
@@ -165,7 +179,7 @@ func (g *Gateway) judge(user string, a *model.Action, what string) string {
 		return ""
 	}
 	reason := strings.Join(a.Reasons, "; ")
-	g.M.Audit.Note("gateway_refused", map[string]any{"gateway": g.R.Name, "user": user, "sql": clip(what, 2000),
+	g.M.Audit.Note("gateway_refused", map[string]any{"gateway": g.R.Name, "user": user, "sql": what,
 		"reason": reason, "mode": g.R.Mode})
 	if g.R.Mode == "watch" {
 		return ""

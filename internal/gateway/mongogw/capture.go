@@ -42,6 +42,10 @@ var adminCmds = setOf("shutdown", "setparameter", "fsync", "fsyncunlock", "repls
 	"addshard", "removeshard", "enablesharding", "shardcollection", "reshardcollection", "movechunk", "moveprimary",
 	"clonecollection", "copydb", "repairdatabase", "validate", "resync", "sleep", "hostinfo", "getcmdlineopts")
 
+// what shows or acts on other sessions (every client is the gateway's one login upstream)
+var otherSessionCmds = setOf("currentop", "killop", "killsessions", "killallsessions", "killallsessionsbypattern",
+	"top", "lockinfo") // endSessions and refreshSessions name the client's own sessions: drivers send them
+
 var unsupportedWrites = setOf("bulkwrite", "mapreduce", "eval", "$eval", "geonear", "group")
 
 func setOf(xs ...string) map[string]bool {
@@ -84,6 +88,9 @@ func (c *command) parse() {
 	}
 	if c.lname == "mapreduce" || c.lname == "eval" || c.lname == "$eval" || hasServerJS(c.msg) {
 		f["server_js"] = true
+	}
+	if otherSessionCmds[c.lname] || (c.lname == "aggregate" && pipelineStage(c.msg.body, "$currentOp", "$listSessions", "$listLocalSessions")) {
+		f["other_sessions"] = true
 	}
 	if c.lname == "aggregate" && pipelineWrites(c.msg.body) {
 		f["aggregation_write"] = true
@@ -131,6 +138,26 @@ func rawHas(d bson.Raw, depth int) bool {
 		}
 		if arr, ok := v.ArrayOK(); ok && rawHas(bson.Raw(arr), depth+1) {
 			return true
+		}
+	}
+	return false
+}
+
+func pipelineStage(b bson.Raw, names ...string) bool {
+	arr, ok := b.Lookup("pipeline").ArrayOK()
+	if !ok {
+		return false
+	}
+	vals, _ := arr.Values()
+	for _, v := range vals {
+		st, ok := v.DocumentOK()
+		if !ok {
+			continue
+		}
+		for _, n := range names {
+			if _, err := st.LookupErr(n); err == nil {
+				return true
+			}
 		}
 	}
 	return false

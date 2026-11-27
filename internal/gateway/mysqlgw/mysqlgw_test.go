@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	_ "github.com/go-sql-driver/mysql"
 
 	"undolayer/internal/connectors/mysql"
@@ -259,6 +260,8 @@ func TestRefusals(t *testing.T) {
 		"mass":        "UPDATE accounts SET owner = 'all'",
 		"cascade":     "DELETE FROM parent WHERE id = 1",
 		"no key":      "UPDATE nokey SET v = 2",
+		"processlist": "SHOW FULL PROCESSLIST",
+		"perf schema": "SELECT * FROM performance_schema.events_statements_current",
 	} {
 		if _, err := c.Exec(q); !refused(err) {
 			t.Errorf("%s was not refused: %v", name, err)
@@ -335,5 +338,31 @@ func TestLogin(t *testing.T) {
 	}
 	if err := e.client(t, "app:wrong", false).Ping(); err == nil {
 		t.Fatal("a wrong password logged in")
+	}
+}
+
+// A pool's connection reset (COM_RESET_CONNECTION) leaves capture in place.
+func TestConnectionReset(t *testing.T) {
+	e := setup(t, nil)
+	c, err := mysql.Dial(mysql.Addr{Host: e.addr, User: "app"}, e.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Execute("UPDATE accounts SET owner = 'r1' WHERE id = 50"); err != nil {
+		t.Fatal(err)
+	}
+	c.ResetSequence()
+	if err := c.WritePacket([]byte{0, 0, 0, 0, gomysql.COM_RESET_CONNECTION}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ReadOKPacket(); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if _, err := c.Execute("UPDATE accounts SET owner = 'r2' WHERE id = 50"); err != nil {
+		t.Fatalf("a write after the reset: %v", err)
+	}
+	if e.txWith(t, "accounts", "update", 50) == "" {
+		t.Fatal("the write after the reset is not in the vault")
 	}
 }

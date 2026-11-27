@@ -215,6 +215,13 @@ func TestRefusalsBehaveLikeServerErrors(t *testing.T) {
 		if err := c.Ping(ctx); err != nil {
 			t.Fatalf("session unusable after a refusal: %v", err)
 		}
+		// clients share the gateway's login: other sessions' statements stay out of sight
+		for _, q := range []string{"SELECT query FROM pg_stat_activity", "SELECT pg_terminate_backend(1)",
+			"SELECT * FROM pg_catalog.pg_locks"} {
+			if _, err := c.Exec(ctx, q); !strings.Contains(fmt.Sprint(err), "refused by Countersign") {
+				t.Fatalf("simple=%v %s was not refused: %v", simple, q, err)
+			}
+		}
 		tx1, _ := c.Begin(ctx)
 		_, _ = tx1.Exec(ctx, "UPDATE accounts SET owner = 'z' WHERE id = 1")
 		_, err = tx1.Exec(ctx, "DROP TABLE accounts")

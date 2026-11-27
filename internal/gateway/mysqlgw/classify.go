@@ -180,6 +180,7 @@ type stmtInfo struct {
 	ddlTables bool   // the statement changes tables' columns (the triggers follow)
 	target    string // the table an INSERT/UPDATE/DELETE writes (unqualified)
 	tempMade  string // CREATE TEMPORARY TABLE name
+	norm      string // the text with its values taken out, as the audit log keeps it
 	facts     map[string]any
 }
 
@@ -216,6 +217,7 @@ func analyze(sql string) *stmtInfo {
 		sig[s] = true
 	}
 	f["query_shape"] = shape.Shape
+	si.norm = clip(shape.Normalized, 2000)
 	w := func(i int) string {
 		if i < len(words) {
 			return words[i]
@@ -245,6 +247,10 @@ func analyze(sql string) *stmtInfo {
 		}
 		if strings.Contains(strings.ToLower(t.text), "countersign") {
 			f["capture_tamper"] = true
+		}
+		switch strings.ToLower(t.text) {
+		case "processlist", "performance_schema", "sys", "innodb_trx", "innodb_lock_waits", "data_locks", "data_lock_waits":
+			f["other_sessions"] = true
 		}
 	}
 	switch w(0) {

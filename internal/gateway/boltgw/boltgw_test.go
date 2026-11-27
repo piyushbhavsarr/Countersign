@@ -229,6 +229,8 @@ func TestRefusals(t *testing.T) {
 		"user":      "CREATE USER x SET PASSWORD 'y'",
 		"dbms":      "CALL dbms.setConfigValue('x', 'y')",
 		"mass":      "MATCH (p:Person) WHERE p.id > 100 DETACH DELETE p",
+		"show txs":  "SHOW TRANSACTIONS",
+		"terminate": "TERMINATE TRANSACTIONS 'neo4j-transaction-1'",
 	} {
 		if _, err := neo4j.ExecuteQuery(ctx, d, q, nil, neo4j.EagerResultTransformer); !refused(err) {
 			t.Errorf("%s was not refused: %v", name, err)

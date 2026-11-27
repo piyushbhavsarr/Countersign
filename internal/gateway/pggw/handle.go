@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 
 	"undolayer/internal/connectors/postgres"
 	"undolayer/internal/model"
@@ -72,13 +73,23 @@ func (s *session) decideFresh(si *stmtInfo) (refuse bool, reason string) {
 	if reason == "" {
 		return false, ""
 	}
-	s.g.M.Audit.Note("gateway_refused", map[string]any{"gateway": s.g.R.Name, "user": s.user, "sql": clip(si.text, 2000),
+	s.g.M.Audit.Note("gateway_refused", map[string]any{"gateway": s.g.R.Name, "user": s.user, "sql": redactSQL(si.text),
 		"reason": reason, "mode": s.g.R.Mode})
 	if s.g.R.Mode == "watch" {
 		return false, ""
 	}
 	s.g.stats.refused.Add(1)
 	return true, reason
+}
+
+// redactSQL is a statement as the audit log keeps it: its values taken out (the log is
+// not encrypted; the full text, with its values, is only in the vault, sealed).
+func redactSQL(sql string) string {
+	n, err := pg_query.Normalize(sql)
+	if err != nil {
+		return "(statement not shown: it does not parse)"
+	}
+	return clip(n, 2000)
 }
 
 func clip(s string, n int) string {
@@ -107,7 +118,7 @@ func (ss *shapeSet) learn(user, shape, text string, g *Gateway) bool {
 	}
 	ss.mu.Unlock()
 	if !seen {
-		g.M.Audit.Note("gateway_shape", map[string]any{"gateway": g.R.Name, "user": user, "shape": shape, "sql": clip(text, 500)})
+		g.M.Audit.Note("gateway_shape", map[string]any{"gateway": g.R.Name, "user": user, "shape": shape, "sql": redactSQL(text)})
 	}
 	return !seen
 }

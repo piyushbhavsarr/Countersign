@@ -42,6 +42,16 @@ var privilegeNodes = map[string]bool{"GrantStmt": true, "GrantRoleStmt": true, "
 var additiveDDL = map[string]bool{"CreateStmt": true, "IndexStmt": true, "ViewStmt": true, "CreateTableAsStmt": true, "CreateSeqStmt": true}
 var readTop = map[string]bool{"SelectStmt": true, "VariableShowStmt": true, "ExplainStmt": true}
 
+// views and functions that show or act on other sessions
+var sessionViews = map[string]bool{"pg_stat_activity": true, "pg_stat_statements": true, "pg_stat_statements_info": true,
+	"pg_locks": true, "pg_blocking_pids": true, "pg_prepared_xacts": true, "pg_stat_replication": true, "pg_stat_ssl": true,
+	"pg_stat_gssapi": true, "pg_stat_progress_vacuum": true, "pg_stat_progress_copy": true, "pg_stat_progress_create_index": true}
+
+var sessionFuncs = map[string]bool{"pg_cancel_backend": true, "pg_terminate_backend": true, "pg_stat_get_activity": true,
+	"pg_stat_get_backend_activity": true, "pg_stat_get_backend_pid": true, "pg_stat_get_backend_idset": true,
+	"pg_stat_statements": true, "pg_stat_statements_reset": true, "pg_blocking_pids": true, "pg_safe_snapshot_blocking_pids": true,
+	"pg_log_backend_memory_contexts": true, "pg_signal_backend": true}
+
 func walk(v any, fn func(key string, node map[string]any)) {
 	switch x := v.(type) {
 	case map[string]any:
@@ -224,6 +234,7 @@ func analyze(sql string) (model.Facts, error) {
 	}
 	stmts, _ := tree["stmts"].([]any)
 	f := model.Facts{"statements": len(stmts)}
+	others := false
 	sigs := map[string]bool{}
 	if fp, err := pg_query.Fingerprint(sql); err == nil {
 		f["query_shape"] = fp
@@ -275,6 +286,9 @@ func analyze(sql string) (model.Facts, error) {
 			name, _ := n["relname"].(string)
 			if schema == "pg_catalog" || schema == "information_schema" || (schema == "" && strings.HasPrefix(name, "pg_")) {
 				sigs["system_catalog"] = true
+			}
+			if sessionViews[name] {
+				others = true
 			}
 		}
 		if kind, ok := dataNodes[k]; ok {
@@ -362,6 +376,14 @@ func analyze(sql string) (model.Facts, error) {
 	}
 	sort.Strings(fl)
 	f["tables_written"], f["functions"] = tl, fl
+	for _, fn := range fl {
+		if sessionFuncs[fn[strings.LastIndex(fn, ".")+1:]] {
+			others = true
+		}
+	}
+	// what other sessions run and hold (through a gateway every client is the same database
+	// user, so these would show one client another's statements, with their values)
+	f["other_sessions"] = others
 	for _, fn := range fl {
 		base := fn[strings.LastIndex(fn, ".")+1:]
 		switch {

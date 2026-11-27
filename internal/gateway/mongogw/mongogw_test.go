@@ -318,6 +318,8 @@ func TestRefusals(t *testing.T) {
 	cases["drop"] = c.Drop(ctx)
 	cases["createUser"] = db.RunCommand(ctx, bson.D{{Key: "createUser", Value: "x"}, {Key: "pwd", Value: "y"}, {Key: "roles", Value: bson.A{}}}).Err()
 	_, cases["mass"] = c.UpdateMany(ctx, bson.D{}, bson.D{{Key: "$set", Value: bson.D{{Key: "owner", Value: "all"}}}})
+	cases["currentOp"] = e.client(t, "").Database("admin").RunCommand(ctx, bson.D{{Key: "currentOp", Value: 1}}).Err()
+	_, cases["$currentOp"] = e.client(t, "").Database("admin").Aggregate(ctx, mongo.Pipeline{{{Key: "$currentOp", Value: bson.D{}}}})
 	_, cases["mass delete"] = c.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: 1000}}}})
 	for name, err := range cases {
 		if !refused(err) {

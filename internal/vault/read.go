@@ -640,6 +640,9 @@ func (v *Vault) assemble(recs []*Record) []*Batch {
 						break
 					}
 					rows, undo = body.Rows, body.Undo
+					if body.Task != "" {
+						b.Task = body.Task
+					}
 				}
 				b.Rows = append(b.Rows, rows...)
 				b.Undo = append(b.Undo, undo...)

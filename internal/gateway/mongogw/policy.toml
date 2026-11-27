@@ -69,3 +69,9 @@ operation = ["commit"]
 when = { collection_fraction_changed = { gt = 0.5 }, docs_affected = { gt = 1000 } }
 decision = "deny"
 reason = "the write changes over half of a collection"
+
+[[rule]]
+id = "gw-other-sessions"
+when = { other_sessions = true }
+decision = "deny"
+reason = "through the gateway every client shares one database login, so this would show or act on other clients' sessions and their statements"

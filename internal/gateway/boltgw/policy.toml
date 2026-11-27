@@ -92,3 +92,9 @@ operation = ["commit"]
 when = { graph_fraction_deleted = { gt = 0.5 }, nodes_deleted = { gt = 1000 } }
 decision = "deny"
 reason = "the transaction deletes over half of the graph"
+
+[[rule]]
+id = "gw-other-sessions"
+when = { other_sessions = true }
+decision = "deny"
+reason = "through the gateway every client shares one database login, so this would show or act on other clients' sessions and their statements"

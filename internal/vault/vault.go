@@ -155,9 +155,12 @@ func aad(r *Record) []byte {
 	return []byte(fmt.Sprintf("%s\x00%d\x00%d\x00%s\x00%s\x00%s", r.Batch, r.Part, r.Parts, r.Tx, r.Connector, r.Phase))
 }
 
+// sealedBody is what a record keeps encrypted: the rows, the undo record, and the task's
+// description (for a gateway, the statement text, with its values).
 type sealedBody struct {
 	Rows []Row  `json:"rows,omitempty"`
 	Undo []byte `json:"undo,omitempty"`
+	Task string `json:"task,omitempty"`
 }
 
 // Options configure a vault.
@@ -659,7 +662,10 @@ func (v *Vault) split(e Entry, batch string, ts float64) ([]*Record, error) {
 		if i < len(undoParts) {
 			body.Undo = undoParts[i]
 		}
-		if v.o.Keys != nil && (body.Rows != nil || body.Undo != nil) {
+		if v.o.Keys != nil && i == 0 && e.Task != "" {
+			body.Task, r.Task = e.Task, ""
+		}
+		if v.o.Keys != nil && (body.Rows != nil || body.Undo != nil || body.Task != "") {
 			plain, err := json.Marshal(body)
 			if err != nil {
 				return nil, err

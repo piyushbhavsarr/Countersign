@@ -103,6 +103,7 @@ func isW(c byte) bool {
 
 type queryInfo struct {
 	text  string
+	norm  string // with its values taken out, as the audit log keeps it
 	write bool
 	facts map[string]any
 }
@@ -151,6 +152,10 @@ func analyzeCypher(q string) *queryInfo {
 		sig[s] = true
 	}
 	f["query_shape"] = shape.Shape
+	qi.norm = shape.Normalized
+	if len(qi.norm) > 2000 {
+		qi.norm = qi.norm[:2000] + "…"
+	}
 	word := func(i int) string {
 		if i >= 0 && i < len(code) && code[i].k == 'w' {
 			return code[i].text
@@ -207,6 +212,9 @@ func analyzeCypher(q string) *queryInfo {
 		f["admin_command"] = true
 	case first == "use":
 		f["database_switch"] = true
+	case (first == "show" || first == "terminate") && (second == "transaction" || second == "transactions" || second == "queries" ||
+		second == "connections"):
+		f["other_sessions"] = true
 	}
 	if sig["stacked"] {
 		f["multi_statement"] = true

@@ -56,13 +56,20 @@ type Route struct {
 	Database string `toml:"database"` // default neo4j
 	// Callback: where the gateway listens for its trigger, and CallbackURL how the database
 	// reaches it (e.g. http://gateway-host:7475/capture).
-	Callback    string            `toml:"callback"`
-	CallbackURL string            `toml:"callback_url"`
-	Advertise   string            `toml:"advertise"` // the address drivers are routed to (default: listen)
-	Mode        string            `toml:"mode"`
-	Users       map[string]string `toml:"users"`
-	Trust       bool              `toml:"trust"`
-	Policy      string            `toml:"policy"`
+	Callback    string `toml:"callback"`
+	CallbackURL string `toml:"callback_url"`
+	Advertise   string `toml:"advertise"` // the address drivers are routed to (default: listen)
+	// CallbackAllow: the networks the database calls from (CIDRs); others are refused.
+	CallbackAllow []string `toml:"callback_allow"`
+	// CallbackCert and CallbackKey serve the callback over TLS (the changes it carries hold
+	// your data: on any network but a private one, use TLS, with a certificate the
+	// database's JVM trusts).
+	CallbackCert string            `toml:"callback_cert"`
+	CallbackKey  string            `toml:"callback_key"`
+	Mode         string            `toml:"mode"`
+	Users        map[string]string `toml:"users"`
+	Trust        bool              `toml:"trust"`
+	Policy       string            `toml:"policy"`
 }
 
 type Gateway struct {
@@ -84,6 +91,8 @@ type Gateway struct {
 	httpSrv *http.Server
 	closed  atomic.Bool
 	stop    chan struct{}
+
+	allow []*net.IPNet
 
 	sizeMu sync.Mutex
 	size   float64
@@ -149,6 +158,16 @@ func New(r Route, m *tx.Manager) (*Gateway, error) {
 		}
 	}
 	g.pol = pol
+	for _, c := range r.CallbackAllow {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			return nil, fmt.Errorf("[[neo4j_gateway]] %s: callback_allow %q: %v", r.Name, c, err)
+		}
+		g.allow = append(g.allow, n)
+	}
+	if (r.CallbackCert == "") != (r.CallbackKey == "") {
+		return nil, fmt.Errorf("[[neo4j_gateway]] %s: give both callback_cert and callback_key", r.Name)
+	}
 	g.selfKey = randKey()
 	g.Conn = n4.New("gw-"+r.Name, "bolt://"+g.addr, g.user, g.pass)
 	return g, nil
@@ -236,6 +255,21 @@ func (g *Gateway) graphSize() float64 {
 
 // ServeHTTP is the trigger's callback: inside the commit, before it completes.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "", 405)
+		return
+	}
+	if len(g.allow) > 0 {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		ip, ok := net.ParseIP(host), false
+		for _, n := range g.allow {
+			ok = ok || (ip != nil && n.Contains(ip))
+		}
+		if !ok {
+			http.Error(w, "", 403)
+			return
+		}
+	}
 	key := r.Header.Get("X-Countersign-Key")
 	body, err := io.ReadAll(io.LimitReader(r.Body, 512<<20))
 	if err != nil {
@@ -264,6 +298,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	changes := p.Changes()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.got { // a transaction commits once: a second call with its key is not its trigger
+		http.Error(w, `{"refused":"already reported"}`, 403)
+		return
+	}
 	c.got = true
 	if len(changes) == 0 {
 		w.Write([]byte(`{"ok":true}`))
@@ -325,13 +363,21 @@ func (g *Gateway) judge(user string, a *model.Action, what string) string {
 		return ""
 	}
 	reason := strings.Join(a.Reasons, "; ")
-	g.M.Audit.Note("gateway_refused", map[string]any{"gateway": g.R.Name, "user": user, "query": clip(what, 2000),
+	g.M.Audit.Note("gateway_refused", map[string]any{"gateway": g.R.Name, "user": user, "query": what,
 		"reason": reason, "mode": g.R.Mode})
 	if g.R.Mode == "watch" {
 		return ""
 	}
 	g.stats.refused.Add(1)
 	return reason
+}
+
+func (g *Gateway) redacted(qs []string) []string {
+	out := make([]string, 0, len(qs))
+	for _, q := range qs {
+		out = append(out, g.qc.get(q).norm)
+	}
+	return out
 }
 
 func clip(s string, n int) string {
@@ -350,7 +396,7 @@ func (g *Gateway) settle(c *capture, committed, wrote bool) {
 		// committed with changes and no call from the trigger: capture is broken
 		g.healthy.Store(false)
 		g.M.Audit.Note("gateway_uncaptured_commit", map[string]any{"gateway": g.R.Name, "user": c.user,
-			"queries": c.queries, "reason": "the capture trigger did not run; writes are refused until it works again"})
+			"queries": g.redacted(c.queries), "reason": "the capture trigger did not run; writes are refused until it works again"})
 		go func() { _ = g.Install(60 * time.Second) }()
 	}
 	if batch == "" {
@@ -374,7 +420,13 @@ func (g *Gateway) Serve(l net.Listener) error {
 		return fmt.Errorf("callback: %v", err)
 	}
 	g.httpSrv = &http.Server{Handler: g, ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = g.httpSrv.Serve(hl) }()
+	go func() {
+		if g.R.CallbackCert != "" {
+			_ = g.httpSrv.ServeTLS(hl, g.R.CallbackCert, g.R.CallbackKey)
+		} else {
+			_ = g.httpSrv.Serve(hl)
+		}
+	}()
 	if err := g.Install(90 * time.Second); err != nil {
 		if g.R.Mode != "watch" {
 			g.M.Audit.Note("gateway_capture_failed", map[string]any{"gateway": g.R.Name, "error": err.Error()})
@@ -835,7 +887,7 @@ func (s *session) decide(qi *queryInfo) string {
 	if qi.write {
 		eff, op = model.Reversible, "execute"
 	}
-	return s.g.judge(s.user, &model.Action{Connector: "graph", Operation: op, Effect: eff, Facts: f}, qi.text)
+	return s.g.judge(s.user, &model.Action{Connector: "graph", Operation: op, Effect: eff, Facts: f}, qi.norm)
 }
 
 func (g *Gateway) checkUser(user, pass string) bool {
