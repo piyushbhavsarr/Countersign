@@ -172,6 +172,67 @@ undolayer evidence <tx> --out evidence.json -c undolayer.toml
 
 One JSON document with everything about the task: what was asked, every action and its decision, what each reviewer approved or declined and what they saw, the before-state that undo restores (kept even after an undo), the outbox, every audit event, and whether the audit chain is intact.
 
+### Keep every change's before state, in several copies
+
+Before a change runs, what it will delete or overwrite is written to the vault. That covers every old row, dropped tables and columns, the bytes of every file changed or deleted, Kubernetes objects, cloud resource settings, branch heads, and the exact way back. The change runs only once a majority of the vault's replicas have it on disk. If they can't take it, the change doesn't run.
+
+```toml
+[vault]
+replicas = ["/mnt/disk1/countersign", "/mnt/disk2/countersign", "/mnt/nfs/countersign"]
+# write_quorum = 2                     (default: a majority)
+# require_independent_replicas = true  (refuse replicas on the same disk)
+# key_file = "/etc/countersign/vault.keys"
+```
+
+Without a `[vault]` section, one copy is kept in `state_dir/vault`.
+
+- **Replicas.** Each replica is an append-only, checksummed hash chain. A replica that was down is caught up before it takes new writes, streamed in batches however far behind it is. A damaged replica is repaired from the others. Nothing is ever deleted: damaged or out-of-place records are moved aside, and reads still find them. `vault check` warns when replicas share a disk.
+- **Encryption.** What the vault holds is encrypted with AES-256-GCM, under keys kept apart from the replicas. Checking and repairing replicas never needs the keys.
+- **Shredding.** Shredding a key makes everything it sealed unreadable on every replica, and in every backup of them. Use it for privacy erasure requests: rotate keys per period or per customer, then shred the one you need to.
+- **Fast lookups.** Each replica keeps an index by task, so finding one task's changes doesn't read the whole vault.
+
+```sh
+undolayer vault check  -c undolayer.toml     # every replica: records, missing, damaged, shared disks
+undolayer vault repair -c undolayer.toml
+undolayer vault keys | rotate-key | shred-key <id>
+```
+
+### See, export, restore and revert what changed
+
+```sh
+undolayer changes <tx> --op delete                     # every deleted row or file, with its content
+undolayer changes <tx> --format csv --out deleted.csv  # or json, or sql to run by hand
+undolayer restore <tx> --key '{"id": 42}' --dry-run    # put chosen rows back...
+undolayer restore <tx> --table orders --on-conflict skip
+undolayer restore <tx> --path config/app.yaml          # ...or chosen files
+undolayer revert --table orders --since 2026-11-27T14:00:00Z  # one table back to a moment
+undolayer revert --requester billing-agent --since 2h  # undo everything one caller did
+```
+
+`changes` reads the task's journal, or the vault if the journal is gone. Files come back from the vault even when this machine's backup is gone.
+
+A table the task dropped comes back first, with its rows, indexes and triggers. A dropped column comes back with its values, added at the end of the table; `undo` of the whole task restores the exact column order.
+
+`revert --table` restores what every task committed to that table since that moment, newest first, in one new task. Other tables those tasks changed are left as they are.
+
+`restore` puts back only the rows you choose. It first checks that each row is still as that task left it, so a newer change is never overwritten; with `--on-conflict skip` it restores the others and lists the rest. The restore is a new task: it is previewed, approved under your policy, checked again at commit, and can itself be undone. Values come back exactly as they were: integers past 2^53, reals, blobs, NaN, timestamps, arrays, JSON. Parent rows go back before their children.
+
+`revert` undoes a caller's committed tasks newest first. It stops at the first one that can't be undone cleanly, rather than leave an older change undone under a newer one.
+
+### Catch SQL injection by its structure
+
+Injection changes the shape of a query, not only its values. Countersign takes each statement's shape from PostgreSQL's own parser, and from SQLite's tokens plus what SQLite reports about the functions a statement calls and the tables it reads. It reports these signs as facts for policy:
+
+- an always-true `OR` (`OR 1=1`, `OR 'a'='a'`, `OR true`)
+- a trailing `--` comment that cuts the query off
+- `UNION`
+- more than one statement
+- reads of system tables
+- time delays (`pg_sleep`)
+- file, program or code access (`pg_read_file`, `COPY ... PROGRAM`, `dblink`, `load_extension`)
+
+By default, an injected read is refused before it runs; an injected write is staged, measured and sent to a human; time delays and file or program access are refused. Each statement also carries `query_shape`, plus `shape_new` when its caller has never committed a query of that shape (shapes are learned only from committed tasks). Postgres parses each distinct statement once and caches the result.
+
 ### Learn from your reviewers
 
 Countersign can train a small risk model on the decisions your reviewers have already made, so actions that look like ones they declined before get flagged automatically.
