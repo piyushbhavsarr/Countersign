@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"undolayer/internal/connectors/mcpproxy"
 	"undolayer/internal/model"
 	"undolayer/internal/tx"
 	"undolayer/internal/vault"
@@ -611,3 +612,46 @@ func freezeCmd(m *tx.Manager, cmd string, args []string) {
 		fmt.Printf("%s can act again\n", args[0])
 	}
 }
+
+// undolayer mcp list | pin <server>
+// pin accepts a server's current tool definitions after review; tools that changed since
+// the last pin are listed.
+func mcpCmd(m *tx.Manager, args []string) {
+	switch first(args) {
+	case "list":
+		out := []map[string]any{}
+		for name, c := range m.Connectors() {
+			if pc, ok := c.(*mcpproxy.Connector); ok {
+				ops := pc.Operations()
+				tools := []string{}
+				for t := range ops {
+					tools = append(tools, t)
+				}
+				sort.Strings(tools)
+				out = append(out, map[string]any{"server": name, "tools": tools})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return fmt.Sprint(out[i]["server"]) < fmt.Sprint(out[j]["server"]) })
+		printJSON(out)
+	case "pin":
+		if len(args) < 2 {
+			die(errors.New("usage: undolayer mcp pin <server>"))
+		}
+		c, err := m.Connector(args[1])
+		pc, ok := c.(*mcpproxy.Connector)
+		if err != nil || !ok {
+			die(fmt.Errorf("no [[mcp_server]] named %s", args[1]))
+		}
+		changed, err := pc.Pin()
+		if err != nil {
+			die(err)
+		}
+		_ = m.Audit.Record("mcp_pin", map[string]any{"server": args[1], "changed": changed})
+		fmt.Printf("pinned %s; tools whose definition changed: %v\n", args[1], changed)
+		pc.Close()
+	default:
+		die(errors.New("usage: undolayer mcp list | pin <server> -c undolayer.toml"))
+	}
+}
+
+func printJSON(v any) { out(v) }

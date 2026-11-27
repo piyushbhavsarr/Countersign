@@ -32,6 +32,7 @@ import (
 	"undolayer/internal/connectors/effects"
 	gitc "undolayer/internal/connectors/git"
 	"undolayer/internal/connectors/kube"
+	"undolayer/internal/connectors/mcpproxy"
 	"undolayer/internal/connectors/postgres"
 	"undolayer/internal/connectors/sqlite"
 	"undolayer/internal/connectors/workspace"
@@ -78,7 +79,9 @@ type Config struct {
 		Paths []string `toml:"paths"`
 	} `toml:"registry"`
 	Credentials map[string]creds.Spec `toml:"credentials"`
-	HTTP        struct {
+	// [[mcp_server]]: other MCP servers behind the gateway (command for stdio, or url).
+	MCPServers []mcpproxy.Server `toml:"mcp_server"`
+	HTTP       struct {
 		AllowHosts []string `toml:"allow_hosts"`
 		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
 		// networks. Cloud metadata services are refused regardless.
@@ -421,6 +424,19 @@ registry:
 			kc.Namespace = k.Namespace
 		}
 		m.Register(kc)
+	}
+	for _, sv := range c.MCPServers {
+		if _, err := m.Connector(sv.Name); err == nil {
+			return nil, nil, fmt.Errorf("[[mcp_server]] %s: a connector of that name exists", sv.Name)
+		}
+		if len(sv.Command) > 0 && !filepath.IsAbs(sv.Command[0]) && strings.Contains(sv.Command[0], "/") {
+			sv.Command[0] = c.Abs(sv.Command[0])
+		}
+		pc, err := mcpproxy.New(sv, c.StateDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		m.Register(pc)
 	}
 	return m, fs, nil
 }

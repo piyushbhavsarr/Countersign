@@ -168,6 +168,31 @@ when = { host_allowed = false }
 decision = "deny"
 reason = "Host is not covered by any delegated credential or allow-list"
 
+# ---------------------------------------------------------------- Tools on other MCP servers
+[[rule]]
+id = "mcp-tool-changed"
+when = { tool_changed = true }
+decision = "deny"
+reason = "This tool's definition changed since it was pinned (a server can rewrite a tool to steer agents); an operator must review it: undolayer mcp pin <server>"
+
+[[rule]]
+id = "mcp-tool-unpinned"
+when = { tool_pinned = false }
+decision = "deny"
+reason = "This tool appeared after the server was pinned; an operator must review it: undolayer mcp pin <server>"
+
+[[rule]]
+id = "url-args-metadata"
+when = { url_args_network = "metadata" }
+decision = "deny"
+reason = "An argument points at a cloud metadata service, which hands out the machine's own credentials"
+
+[[rule]]
+id = "url-args-private"
+when = { url_args_network = { in = ["loopback", "link_local", "private"] }, url_args_private_allowed = false }
+decision = "deny"
+reason = "An argument points at this machine or a private network (SSRF); the operator can allow the host for this server"
+
 # ---------------------------------------------------------------- Messaging
 [[rule]]
 id = "effect-large-audience"

@@ -14,6 +14,7 @@
 //	undolayer revert --requester NAME [--since 2h] [--until TIME] [--dry-run] [--yes]
 //	undolayer vault check | repair | keys | rotate-key | shred-key <id>
 //	undolayer freeze <requester> [--reason TEXT] | unfreeze <requester> | frozen
+//	undolayer mcp list | pin <server>
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
 
@@ -174,6 +175,11 @@ func main() {
 	case "risk":
 		parseArgs(fs, args)
 		riskCmd(*cfgPath, fs.Args())
+		return
+	case "mcp":
+		parseArgs(fs, args)
+		_, m := load(*cfgPath)
+		mcpCmd(m, fs.Args())
 		return
 	case "freeze", "unfreeze", "frozen":
 		parseArgs(fs, args)
