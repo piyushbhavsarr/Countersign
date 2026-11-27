@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"undolayer/internal/connectors/mcpproxy"
+	"undolayer/internal/gateway/boltgw"
 	"undolayer/internal/gateway/mongogw"
 	"undolayer/internal/gateway/mysqlgw"
 	"undolayer/internal/gateway/pggw"
@@ -680,11 +681,11 @@ func mcpCmd(m *tx.Manager, args []string) {
 
 func printJSON(v any) { out(v) }
 
-// undolayer gateway: serve every [[pg_gateway]], [[mongo_gateway]] and [[mysql_gateway]]
-// until SIGINT or SIGTERM, then finish the vault and audit writes in flight.
+// undolayer gateway: serve every [[pg_gateway]], [[mongo_gateway]], [[mysql_gateway]] and
+// [[neo4j_gateway]] until SIGINT or SIGTERM, then finish the vault and audit writes in flight.
 func gatewayCmd(c *rt.Config, m *tx.Manager) {
-	if len(c.PGGateways) == 0 && len(c.MongoGateways) == 0 && len(c.MySQLGateways) == 0 {
-		die(errors.New("no [[pg_gateway]], [[mongo_gateway]] or [[mysql_gateway]] in the configuration"))
+	if len(c.PGGateways)+len(c.MongoGateways)+len(c.MySQLGateways)+len(c.Neo4jGateways) == 0 {
+		die(errors.New("no [[pg_gateway]], [[mongo_gateway]], [[mysql_gateway]] or [[neo4j_gateway]] in the configuration"))
 	}
 	type server interface {
 		Serve(net.Listener) error
@@ -728,6 +729,14 @@ func gatewayCmd(c *rt.Config, m *tx.Manager) {
 		}
 		m.Register(g.Conn)
 		start("mysql_gateway", r.Name, r.Listen, r.URI, g.R.Mode, g)
+	}
+	for _, r := range c.Neo4jGateways {
+		g, err := boltgw.New(r, m)
+		if err != nil {
+			die(err)
+		}
+		m.Register(g.Conn)
+		start("neo4j_gateway", r.Name, r.Listen, r.URI, g.R.Mode, g)
 	}
 	stop := make(chan struct{})
 	if m.Vault != nil {

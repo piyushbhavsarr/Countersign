@@ -19,6 +19,7 @@ package runtime
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -35,10 +36,12 @@ import (
 	"undolayer/internal/connectors/mcpproxy"
 	mongoconn "undolayer/internal/connectors/mongo"
 	mysqlconn "undolayer/internal/connectors/mysql"
+	neo4jconn "undolayer/internal/connectors/neo4j"
 	"undolayer/internal/connectors/postgres"
 	"undolayer/internal/connectors/sqlite"
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
+	"undolayer/internal/gateway/boltgw"
 	"undolayer/internal/gateway/mongogw"
 	"undolayer/internal/gateway/mysqlgw"
 	"undolayer/internal/gateway/pggw"
@@ -93,6 +96,8 @@ type Config struct {
 	MongoGateways []mongogw.Route `toml:"mongo_gateway"`
 	// [[mysql_gateway]]: Countersign in front of MySQL, speaking its protocol
 	MySQLGateways []mysqlgw.Route `toml:"mysql_gateway"`
+	// [[neo4j_gateway]]: Countersign in front of Neo4j, speaking Bolt
+	Neo4jGateways []boltgw.Route `toml:"neo4j_gateway"`
 	HTTP          struct {
 		AllowHosts []string `toml:"allow_hosts"`
 		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
@@ -552,6 +557,14 @@ registry:
 			return nil, nil, fmt.Errorf("[[mysql_gateway]] %s: %v", r.Name, err)
 		}
 		m.Register(mysqlconn.New("gw-"+r.Name, a))
+	}
+	for _, r := range c.Neo4jGateways {
+		u, err := url.Parse(r.URI)
+		if err != nil || u.Host == "" {
+			return nil, nil, fmt.Errorf("[[neo4j_gateway]] %s: uri is bolt://user:password@host:7687", r.Name)
+		}
+		pw, _ := u.User.Password()
+		m.Register(neo4jconn.New("gw-"+r.Name, "bolt://"+u.Host, u.User.Username(), pw))
 	}
 	for _, sv := range c.MCPServers {
 		if _, err := m.Connector(sv.Name); err == nil {

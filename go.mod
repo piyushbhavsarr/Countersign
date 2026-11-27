@@ -9,6 +9,7 @@ require (
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/mattn/go-sqlite3 v1.14.53
+	github.com/neo4j/neo4j-go-driver/v5 v5.28.6
 	github.com/pganalyze/pg_query_go/v6 v6.2.5
 	github.com/pmezard/go-difflib v1.0.0
 	go.mongodb.org/mongo-driver/v2 v2.5.1

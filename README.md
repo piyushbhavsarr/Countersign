@@ -266,7 +266,7 @@ mode = "enforce"                                            # or "watch": refuse
 
 ```sh
 undolayer pg install -c undolayer.toml    # once per database: row capture and the refusal function
-undolayer gateway -c undolayer.toml      # serves every [[pg_gateway]], [[mongo_gateway]] and [[mysql_gateway]]
+undolayer gateway -c undolayer.toml      # serves every [[pg_gateway]], [[mongo_gateway]], [[mysql_gateway]] and [[neo4j_gateway]]
 ```
 
 - **Protect.** Each statement is checked from PostgreSQL's own parse tree: injection signs, query shape, and what it touches. The result is cached by statement text. Sessions go to the main database or to a replica that isn't lagging, and the gateway follows a failover. If two servers both claim to be the main database, writes are refused.
@@ -320,6 +320,37 @@ mode = "enforce"
   - Before COMMIT is passed on, the rows are checked against the tables' current columns and stored in the vault on a quorum.
   - A write that changed rows nothing recorded is refused. That happens on a table created outside the gateway, until the next sync reaches it (every 10 seconds).
   - Types survive exactly: binary as hex, `TIMESTAMP` as epoch seconds, JSON as JSON.
+
+### Put it in front of Neo4j
+
+Neo4j drivers connect to Countersign over Bolt (5.1 and later), with `bolt://` or `neo4j://` (routing tables point back at the gateway). It needs Neo4j 5 with APOC and `apoc.trigger.enabled=true`.
+
+```toml
+[[neo4j_gateway]]
+name = "graph"
+listen = "127.0.0.1:7688"
+uri = "bolt://countersign:...@graph-db:7687"
+callback = "0.0.0.0:7475"                          # where the gateway hears its trigger
+callback_url = "http://gateway-host:7475/capture"  # how the database reaches it
+users = { app = "app-password" }
+```
+
+- **Protect.** Each Cypher query is checked before it runs:
+  - always-true `OR` conditions and `apoc.util.sleep`;
+  - `LOAD CSV` and `apoc.load`/`import`/`export`;
+  - Cypher built from strings (`apoc.cypher.*`, `apoc.do.*`);
+  - work split into separate transactions (`IN TRANSACTIONS`, `apoc.periodic`);
+  - user, role and database administration, impersonation, and the gateway's own trigger.
+- **Block.** A refused query gets an ordinary Neo4j `Forbidden` error. Each transaction is checked again inside its commit, on how many nodes and relationships it actually changed and what share of the graph it deletes.
+- **Undo.**
+  - Every transaction through the gateway carries a key in its metadata. The gateway's APOC trigger runs inside the commit and sends the gateway what changed:
+    - created nodes and relationships;
+    - deleted ones, with their labels, types, endpoints and properties;
+    - every property and label that was set or removed, with its old value.
+  - The gateway stores that in the vault on a quorum before it answers. If it refuses, or there is no quorum, the commit fails.
+  - Values keep their Cypher types (dates, datetimes, durations, integers).
+  - Undo deletes what was created, puts back what was changed, and recreates what was deleted, with its relationships. It does all of this in one transaction, and only if nothing has changed since.
+  - The gateway refuses writes until it has seen its trigger work. It checks the trigger again every 30 seconds.
 
 ### Put other MCP servers behind it
 

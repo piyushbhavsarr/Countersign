@@ -1,0 +1,94 @@
+# Countersign Neo4j gateway policy: for an application's (or agent's) own traffic.
+# Queries are judged from their Cypher text; each transaction is judged again inside its
+# commit, on what it actually changed (entities_affected, nodes_deleted,
+# relationships_deleted, nodes_created, graph_fraction_deleted). deny and require_approval
+# both refuse; mode = "watch" audits them instead.
+
+[settings]
+hold_irreversible = false
+require_approval_for_commit = false
+redact_results = false
+
+[budget]
+max_rows_changed = 0
+max_table_fraction_changed = 0
+
+[[rule]]
+id = "gw-injection-or-tautology"
+when = { cypher_injection_signals = { in = ["or_tautology"] } }
+decision = "deny"
+reason = "an always-true OR condition (OR 1=1, OR true) is how injected input widens a query to the whole graph"
+
+[[rule]]
+id = "gw-time-delay"
+when = { cypher_injection_signals = { in = ["time_delay"] } }
+decision = "deny"
+reason = "apoc.util.sleep is how blind injection reads data one timing at a time"
+
+[[rule]]
+id = "gw-file-or-network"
+when = { cypher_injection_signals = { in = ["file_or_program"] } }
+decision = "deny"
+reason = "LOAD CSV and apoc.load/import/export reach files and the network from the database server"
+
+[[rule]]
+id = "gw-multi-statement"
+when = { multi_statement = true }
+decision = "deny"
+reason = "several statements in one query is how injected input appends its own"
+
+[[rule]]
+id = "gw-dynamic-cypher"
+when = { dynamic_cypher = true }
+decision = "deny"
+reason = "apoc.cypher.*, apoc.do.* and apoc.when run Cypher built from strings, which the gateway cannot read"
+
+[[rule]]
+id = "gw-separate-transactions"
+when = { separate_transactions = true }
+decision = "deny"
+reason = "CALL ... IN TRANSACTIONS and apoc.periodic split work into transactions of their own; run batches as separate queries"
+
+[[rule]]
+id = "gw-destroys-schema"
+when = { destroys_schema = true }
+decision = "deny"
+reason = "dropping or replacing a database destroys it outright"
+
+[[rule]]
+id = "gw-privileges"
+when = { privilege_change = true }
+decision = "deny"
+reason = "creating or changing users and roles, and granting privileges, is not done through this gateway"
+
+[[rule]]
+id = "gw-admin"
+when = { admin_command = true }
+decision = "deny"
+reason = "database and server administration (dbms.*, databases, aliases, servers) is not done through this gateway"
+
+[[rule]]
+id = "gw-database-switch"
+when = { database_switch = true }
+decision = "deny"
+reason = "only the gateway's database is captured; USE another is refused"
+
+[[rule]]
+id = "gw-capture"
+when = { capture_tamper = true }
+decision = "deny"
+reason = "the gateway's own capture (its trigger, its keys) cannot be touched by a session"
+
+[[rule]]
+id = "gw-mass-change"
+operation = ["commit"]
+when = { entities_affected = { gt = 100000 } }
+decision = "deny"
+reason = "the transaction changes more than 100,000 nodes and relationships"
+
+[[rule]]
+id = "gw-graph-fraction"
+operation = ["commit"]
+when = { graph_fraction_deleted = { gt = 0.5 }, nodes_deleted = { gt = 1000 } }
+decision = "deny"
+reason = "the transaction deletes over half of the graph"
