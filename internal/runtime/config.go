@@ -34,11 +34,13 @@ import (
 	"undolayer/internal/connectors/kube"
 	"undolayer/internal/connectors/mcpproxy"
 	mongoconn "undolayer/internal/connectors/mongo"
+	mysqlconn "undolayer/internal/connectors/mysql"
 	"undolayer/internal/connectors/postgres"
 	"undolayer/internal/connectors/sqlite"
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
 	"undolayer/internal/gateway/mongogw"
+	"undolayer/internal/gateway/mysqlgw"
 	"undolayer/internal/gateway/pggw"
 	"undolayer/internal/policy"
 	"undolayer/internal/registry"
@@ -89,6 +91,8 @@ type Config struct {
 	PGGateways []pggw.Route `toml:"pg_gateway"`
 	// [[mongo_gateway]]: Countersign in front of MongoDB, speaking its wire protocol
 	MongoGateways []mongogw.Route `toml:"mongo_gateway"`
+	// [[mysql_gateway]]: Countersign in front of MySQL, speaking its protocol
+	MySQLGateways []mysqlgw.Route `toml:"mysql_gateway"`
 	HTTP          struct {
 		AllowHosts []string `toml:"allow_hosts"`
 		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
@@ -541,6 +545,13 @@ registry:
 	}
 	for _, r := range c.MongoGateways {
 		m.Register(mongoconn.New("gw-"+r.Name, r.URI))
+	}
+	for _, r := range c.MySQLGateways {
+		a, err := mysqlconn.ParseURI(r.URI)
+		if err != nil {
+			return nil, nil, fmt.Errorf("[[mysql_gateway]] %s: %v", r.Name, err)
+		}
+		m.Register(mysqlconn.New("gw-"+r.Name, a))
 	}
 	for _, sv := range c.MCPServers {
 		if _, err := m.Connector(sv.Name); err == nil {

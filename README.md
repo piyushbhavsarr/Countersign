@@ -266,7 +266,7 @@ mode = "enforce"                                            # or "watch": refuse
 
 ```sh
 undolayer pg install -c undolayer.toml    # once per database: row capture and the refusal function
-undolayer gateway -c undolayer.toml      # serves every [[pg_gateway]] and [[mongo_gateway]]
+undolayer gateway -c undolayer.toml      # serves every [[pg_gateway]], [[mongo_gateway]] and [[mysql_gateway]]
 ```
 
 - **Protect.** Each statement is checked from PostgreSQL's own parse tree: injection signs, query shape, and what it touches. The result is cached by statement text. Sessions go to the main database or to a replica that isn't lagging, and the gateway follows a failover. If two servers both claim to be the main database, writes are refused.
@@ -297,6 +297,29 @@ mode = "enforce"
   - Undo puts each document back in one transaction, and only if it is still as the write left it.
 
   The server must be a replica set member or a `mongos`. On a standalone server, writes are refused in enforce mode.
+
+### Put it in front of MySQL
+
+Any MySQL driver connects to Countersign as to the server. Both text queries and prepared statements work.
+
+```toml
+[[mysql_gateway]]
+name = "shop"
+listen = "127.0.0.1:3307"
+uri = "mysql://countersign:...@db:3306/shop"   # needs TRIGGER and CREATE TEMPORARY TABLES
+users = { app = "app-password" }
+mode = "enforce"
+```
+
+- **Protect.** Each statement is read with MySQL's own lexical rules, including backslash escapes, `#` comments, and the `/*! ... */` comments MySQL runs.
+  - Always-true `OR` conditions, `SLEEP` and `BENCHMARK`, file access (`LOAD_FILE`, `INTO OUTFILE`, `LOAD DATA`) and multi-statement queries are refused.
+  - So are destroying schema, privilege changes, `PREPARE`/`EXECUTE` in SQL, new routines, server administration, and any attempt to touch capture.
+- **Block.** A refused statement gets an ordinary MySQL access-denied error. A transaction is checked again before its COMMIT on what it actually changed: rows, the share of a table, tables without a primary key, and foreign-key cascades.
+- **Undo.**
+  - The gateway installs triggers on every table and keeps them in step with the schema. They record each changed row, before and after, into a temporary table that only gateway sessions have. Direct sessions skip that branch, so their cost is one `IF`.
+  - Before COMMIT is passed on, the rows are checked against the tables' current columns and stored in the vault on a quorum.
+  - A write that changed rows nothing recorded is refused. That happens on a table created outside the gateway, until the next sync reaches it (every 10 seconds).
+  - Types survive exactly: binary as hex, `TIMESTAMP` as epoch seconds, JSON as JSON.
 
 ### Put other MCP servers behind it
 
