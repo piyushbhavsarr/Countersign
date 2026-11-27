@@ -41,6 +41,9 @@ var DefaultSensitiveReads = []string{"secretsmanager:GetSecretValue", "kms:Decry
 
 type Connector struct {
 	tx.Base
+	// Provider: aws (the default), azure or gcp. Azure and GCP connectors offer the
+	// resource_* operations only.
+	Provider       string
 	StateDir       string
 	AWSBin         string
 	ViewProfile    string
@@ -70,7 +73,22 @@ func New(stateDir string) *Connector {
 
 func (*Connector) Egress() bool { return true }
 
+var providerName = map[string]string{"azure": "Azure", "gcp": "Google Cloud"}
+
+// NewResources is a connector for one cloud's resources (azure, gcp) through res.
+func NewResources(provider, stateDir string, res Resources) *Connector {
+	return &Connector{Base: tx.Base{ConnName: provider}, Provider: provider, StateDir: stateDir, CC: res}
+}
+
 func (c *Connector) Operations() map[string]tx.OpSchema {
+	if c.Provider != "" && c.Provider != "aws" {
+		ops := map[string]tx.OpSchema{}
+		for k, v := range ccOperations() {
+			v.Description = strings.ReplaceAll(strings.ReplaceAll(v.Description, "AWS", providerName[c.Provider]), " (Cloud Control)", "")
+			ops[k] = v
+		}
+		return ops
+	}
 	s := map[string]any{"type": "string"}
 	ops := map[string]tx.OpSchema{
 		"terraform_plan":  {Description: "Plan Terraform changes for a directory (read-only).", Properties: map[string]any{"dir": s}, Required: []string{"dir"}},
@@ -484,7 +502,11 @@ func (c *Connector) Preview(t *tx.Tx) map[string]any {
 		for _, ch := range st.CC {
 			l = append(l, ccSummary(ch))
 		}
-		pv["aws_resources"] = l
+		key := "aws_resources"
+		if c.Provider != "" && c.Provider != "aws" {
+			key = c.Provider + "_resources"
+		}
+		pv[key] = l
 	}
 	return pv
 }

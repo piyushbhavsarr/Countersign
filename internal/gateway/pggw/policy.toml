@@ -1,0 +1,95 @@
+# Countersign PostgreSQL gateway policy: for an application's (or agent's) own traffic.
+# Statements are judged from PostgreSQL's parse tree; a transaction is judged again at its
+# COMMIT on what it actually changed (rows_affected, rows_deleted, table_fraction_changed,
+# tables_touched, no_primary_key). deny and require_approval both refuse (an application
+# cannot wait for a person); mode = "watch" audits them instead.
+
+[settings]
+hold_irreversible = false
+require_approval_for_commit = false
+redact_results = false
+
+[budget]
+max_rows_changed = 0
+max_table_fraction_changed = 0
+
+[[rule]]
+id = "gw-injection-or-tautology"
+when = { sql_injection_signals = { in = ["or_tautology"] } }
+decision = "deny"
+reason = "an always-true OR condition (OR 1=1, OR 'a'='a', OR true) is how injected input widens a query to every row"
+
+[[rule]]
+id = "gw-time-delay"
+when = { sql_injection_signals = { in = ["time_delay"] } }
+decision = "deny"
+reason = "pg_sleep and its kin are how blind SQL injection reads data one timing at a time"
+
+[[rule]]
+id = "gw-file-or-program"
+when = { sql_injection_signals = { in = ["file_or_program"] } }
+decision = "deny"
+reason = "the statement reads or writes server files, runs programs or reaches other databases"
+
+[[rule]]
+id = "gw-destroys-schema"
+when = { destroys_schema = true }
+decision = "deny"
+reason = "DROP TABLE, TRUNCATE and dropping columns destroy data outright; run them through a reviewed migration"
+
+[[rule]]
+id = "gw-privileges"
+when = { privilege_change = true }
+decision = "deny"
+reason = "granting, revoking or changing roles and ownership is not done through this gateway"
+
+[[rule]]
+id = "gw-capture-settings"
+when = { pragma_set = { glob = "undolayer.*" } }
+decision = "deny"
+reason = "the gateway's own settings cannot be changed by a session"
+
+[[rule]]
+id = "gw-replication-role"
+when = { pragma_set = { in = ["session_replication_role"] } }
+decision = "deny"
+reason = "session_replication_role turns off triggers (and with them the database's own rules)"
+
+[[rule]]
+id = "gw-opaque-schema"
+when = { schema_unsupported = true }
+decision = "deny"
+reason = "this schema change (disabling triggers, changing types, ...) cannot be kept track of; run it through a reviewed migration"
+
+[[rule]]
+id = "gw-no-primary-key"
+operation = ["commit"]
+when = { no_primary_key = { exists = true, ne = [] } }
+decision = "deny"
+reason = "the transaction changes a table without a primary key, so its rows could not be put back"
+
+[[rule]]
+id = "gw-mass-change"
+operation = ["commit"]
+when = { rows_affected = { gt = 100000 } }
+decision = "deny"
+reason = "the transaction changes more than 100,000 rows"
+
+[[rule]]
+id = "gw-table-fraction"
+operation = ["commit"]
+when = { table_fraction_changed = { gt = 0.5 }, rows_affected = { gt = 1000 } }
+decision = "deny"
+reason = "the transaction changes over half of a table"
+
+[[rule]]
+id = "gw-other-sessions"
+when = { other_sessions = true }
+decision = "deny"
+reason = "through the gateway every client shares one database login, so this would show or act on other clients' sessions and their statements"
+
+[[rule]]
+id = "gw-capture-schema"
+when = { touches_capture = true }
+decision = "deny"
+reason = "the undolayer schema holds every client's before states; nothing reads or changes it through the gateway"

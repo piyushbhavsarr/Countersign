@@ -169,8 +169,8 @@ func TestTheAuditChainStaysLinkedUnderConcurrentAppends(t *testing.T) {
 			go func(i int, s Store) {
 				defer wg.Done()
 				for j := 0; j < 100; j++ {
-					err := s.AppendAudit(func(prev []byte) ([]byte, error) {
-						return []byte(fmt.Sprintf(`{"node":%d,"n":%d,"prev":"%s"}`, i, j, hash(prev))), nil
+					err := s.AppendAudit(func(prev []byte) ([][]byte, error) {
+						return [][]byte{[]byte(fmt.Sprintf(`{"node":%d,"n":%d,"prev":"%s"}`, i, j, hash(prev)))}, nil
 					})
 					if err != nil {
 						t.Error(err)

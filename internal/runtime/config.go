@@ -19,6 +19,7 @@ package runtime
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -32,15 +33,25 @@ import (
 	"undolayer/internal/connectors/effects"
 	gitc "undolayer/internal/connectors/git"
 	"undolayer/internal/connectors/kube"
+	"undolayer/internal/connectors/mcpproxy"
+	mongoconn "undolayer/internal/connectors/mongo"
+	mysqlconn "undolayer/internal/connectors/mysql"
+	neo4jconn "undolayer/internal/connectors/neo4j"
 	"undolayer/internal/connectors/postgres"
 	"undolayer/internal/connectors/sqlite"
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
+	"undolayer/internal/gateway/boltgw"
+	"undolayer/internal/gateway/mongogw"
+	"undolayer/internal/gateway/mysqlgw"
+	"undolayer/internal/gateway/pggw"
 	"undolayer/internal/policy"
 	"undolayer/internal/registry"
 	"undolayer/internal/review"
+	"undolayer/internal/risk"
 	"undolayer/internal/store"
 	"undolayer/internal/tx"
+	"undolayer/internal/vault"
 )
 
 type Config struct {
@@ -76,9 +87,23 @@ type Config struct {
 		Paths []string `toml:"paths"`
 	} `toml:"registry"`
 	Credentials map[string]creds.Spec `toml:"credentials"`
-	HTTP        struct {
-		AllowHosts     []string `toml:"allow_hosts"`
-		AllowedHeaders []string `toml:"allowed_headers"`
+	// [[mcp_server]]: other MCP servers behind the gateway (command for stdio, or url).
+	MCPServers []mcpproxy.Server `toml:"mcp_server"`
+	// [[pg_gateway]]: Countersign in front of a PostgreSQL database, speaking its protocol
+	// (served by undolayer gateway). Its transactions can be undone and restored like any.
+	PGGateways []pggw.Route `toml:"pg_gateway"`
+	// [[mongo_gateway]]: Countersign in front of MongoDB, speaking its wire protocol
+	MongoGateways []mongogw.Route `toml:"mongo_gateway"`
+	// [[mysql_gateway]]: Countersign in front of MySQL, speaking its protocol
+	MySQLGateways []mysqlgw.Route `toml:"mysql_gateway"`
+	// [[neo4j_gateway]]: Countersign in front of Neo4j, speaking Bolt
+	Neo4jGateways []boltgw.Route `toml:"neo4j_gateway"`
+	HTTP          struct {
+		AllowHosts []string `toml:"allow_hosts"`
+		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
+		// networks. Cloud metadata services are refused regardless.
+		AllowPrivateHosts []string `toml:"allow_private_hosts"`
+		AllowedHeaders    []string `toml:"allowed_headers"`
 	} `toml:"http"`
 	Effects struct {
 		OrgDomains    []string           `toml:"org_domains"`
@@ -96,6 +121,26 @@ type Config struct {
 		// how long a resource create/update/delete may take before it is reported as stuck
 		ResourceTimeout string `toml:"resource_timeout"`
 	} `toml:"aws"`
+	// [azure]: Azure Resource Manager resources (the "azure" connector). Enabled when
+	// subscription or api_versions is set. Tokens come from `az account get-access-token`
+	// unless token_command says otherwise; the credential's own Azure roles decide what it may do.
+	Azure struct {
+		Subscription    string              `toml:"subscription"`
+		BaseURL         string              `toml:"base_url"`
+		TokenCommand    []string            `toml:"token_command"`
+		APIVersions     map[string]string   `toml:"api_versions"`
+		WriteOnly       map[string][]string `toml:"write_only"`
+		PutTypes        []string            `toml:"put_types"`
+		ResourceTimeout string              `toml:"resource_timeout"`
+	} `toml:"azure"`
+	// [gcp]: Google Cloud resources (the "gcp" connector), one [gcp.types."<service>/<Kind>"]
+	// per type to manage. Tokens come from `gcloud auth print-access-token` unless
+	// token_command says otherwise.
+	GCP struct {
+		TokenCommand    []string                 `toml:"token_command"`
+		Types           map[string]cloud.GCPType `toml:"types"`
+		ResourceTimeout string                   `toml:"resource_timeout"`
+	} `toml:"gcp"`
 	Kubernetes struct {
 		Context     string `toml:"context"`     // kubeconfig context; the connector is enabled when set
 		Kubeconfig  string `toml:"kubeconfig"`  // default: kubectl's own ($KUBECONFIG, ~/.kube/config)
@@ -120,6 +165,40 @@ type Config struct {
 		Requester         string   `toml:"requester"`           // who asks for tasks (default: the OS user)
 	} `toml:"approvals"`
 	// [reviewers.<name>] key = "ssh-ed25519 AAAA... alice", roles = [...], users = [...]
+	// Risk: a model trained with `undolayer risk train` scores every action (the fact
+	// risk_score, 0 to 1); policy rules decide what a score means.
+	Risk struct {
+		Model string `toml:"model"`
+	} `toml:"risk"`
+	// Vault: where each change's before state is kept, written before the change runs.
+	// replicas are directories, ideally on independent disks or volumes; a change runs only
+	// once write_quorum of them (default: a majority) have its before state on disk.
+	// Default: one replica in state_dir/vault.
+	// Content is sealed with AES-256-GCM under keys in key_file (default state_dir/vault.keys),
+	// kept apart from the replicas: shredding a key makes what it sealed unreadable on every
+	// replica. encrypt = false stores it in the clear. require_independent_replicas refuses
+	// replicas on the same device.
+	Vault struct {
+		Replicas           []string `toml:"replicas"`
+		WriteQuorum        int      `toml:"write_quorum"`
+		Disabled           bool     `toml:"disabled"`
+		Encrypt            *bool    `toml:"encrypt"`
+		KeyFile            string   `toml:"key_file"`
+		RequireIndependent bool     `toml:"require_independent_replicas"`
+		// [vault.archive]: sealed segments go, write-once (S3 Object Lock), to object storage:
+		// AWS S3, MinIO, R2, or GCS through its S3 interface; a bucket in another region is
+		// the vault's off-site copy. Keys come from the named environment variables.
+		Archive *struct {
+			Endpoint     string `toml:"endpoint"`
+			Region       string `toml:"region"`
+			Bucket       string `toml:"bucket"`
+			Prefix       string `toml:"prefix"`
+			AccessKeyEnv string `toml:"access_key_env"`
+			SecretKeyEnv string `toml:"secret_key_env"`
+			LockDays     int    `toml:"lock_days"`
+			Every        string `toml:"every"`
+		} `toml:"archive"`
+	} `toml:"vault"`
 	Reviewers map[string]map[string]any `toml:"reviewers"`
 	// [[approval_rule]] id, connector, operation, effect, when, roles, count, reason
 	ApprovalRules []map[string]any `toml:"approval_rule"`
@@ -180,6 +259,13 @@ func Build(c *Config) (*tx.Manager, *workspace.FS, error) {
 		}
 		pol = pol.Extend(p)
 	}
+	if c.Risk.Model != "" {
+		rm, err := risk.Load(c.Abs(c.Risk.Model))
+		if err != nil {
+			return nil, nil, fmt.Errorf("[risk] model: %v", err)
+		}
+		pol.Risk = rm
+	}
 	var m *tx.Manager
 	var err error
 	if c.StateStore != "" {
@@ -199,6 +285,61 @@ func Build(c *Config) (*tx.Manager, *workspace.FS, error) {
 	}
 	if c.Node != "" {
 		m.Node = c.Node
+	}
+	if !c.Vault.Disabled {
+		reps := []string{}
+		for _, r := range c.Vault.Replicas {
+			reps = append(reps, c.Abs(r))
+		}
+		if len(reps) == 0 {
+			reps = []string{filepath.Join(c.StateDir, "vault")}
+		}
+		var keys *vault.Keyring
+		if c.Vault.Encrypt == nil || *c.Vault.Encrypt {
+			kf := filepath.Join(c.StateDir, "vault.keys")
+			if c.Vault.KeyFile != "" {
+				kf = c.Abs(c.Vault.KeyFile)
+			}
+			for _, r := range reps {
+				if rel, err := filepath.Rel(r, kf); err == nil && !strings.HasPrefix(rel, "..") {
+					return nil, nil, fmt.Errorf("[vault] key_file must not be inside a replica (%s): shredding a key would not reach copies of the replica", r)
+				}
+			}
+			var err error
+			if keys, err = vault.OpenKeyring(kf); err != nil {
+				return nil, nil, fmt.Errorf("[vault] key_file: %w", err)
+			}
+		}
+		var arch *vault.Archive
+		if a := c.Vault.Archive; a != nil {
+			if a.Endpoint == "" || a.Bucket == "" || a.AccessKeyEnv == "" || a.SecretKeyEnv == "" {
+				return nil, nil, errors.New("[vault.archive] needs endpoint, bucket, access_key_env and secret_key_env")
+			}
+			ak, sk := os.Getenv(a.AccessKeyEnv), os.Getenv(a.SecretKeyEnv)
+			if ak == "" || sk == "" {
+				return nil, nil, fmt.Errorf("[vault.archive]: %s and %s must be set", a.AccessKeyEnv, a.SecretKeyEnv)
+			}
+			region := a.Region
+			if region == "" {
+				region = "us-east-1"
+			}
+			every := 30 * time.Second
+			if a.Every != "" {
+				d, err := time.ParseDuration(a.Every)
+				if err != nil {
+					return nil, nil, fmt.Errorf("[vault.archive] every: %v", err)
+				}
+				every = d
+			}
+			arch = &vault.Archive{S3: &vault.S3{Endpoint: a.Endpoint, Region: region, Bucket: a.Bucket, AccessKey: ak, SecretKey: sk},
+				Prefix: a.Prefix, LockDays: a.LockDays, Every: every}
+		}
+		v, err := vault.Open(vault.Options{Replicas: reps, WriteQuorum: c.Vault.WriteQuorum, Keys: keys, Archive: arch,
+			RequireIndependent: c.Vault.RequireIndependent, LockPath: filepath.Join(c.StateDir, "vault.lock")})
+		if err != nil {
+			return nil, nil, fmt.Errorf("[vault]: %w", err)
+		}
+		m.Vault = v
 	}
 	if c.Approvals.Wait != "" {
 		d, err := time.ParseDuration(c.Approvals.Wait)
@@ -315,7 +456,7 @@ registry:
 	}
 	m.Register(ef)
 	h := effects.NewHTTP(store, nil)
-	h.AllowHosts = c.HTTP.AllowHosts
+	h.AllowHosts, h.AllowPrivateHosts = c.HTTP.AllowHosts, c.HTTP.AllowPrivateHosts
 	if len(c.HTTP.AllowedHeaders) > 0 {
 		h.AllowedHeaders = c.HTTP.AllowedHeaders
 	}
@@ -344,6 +485,49 @@ registry:
 		cl.EnableResources(to)
 	}
 	m.Register(cl)
+	timeout := func(s, section string) (time.Duration, error) {
+		if s == "" {
+			return 30 * time.Minute, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("[%s] resource_timeout: %w", section, err)
+		}
+		return d, nil
+	}
+	if az := c.Azure; az.Subscription != "" || len(az.APIVersions) > 0 {
+		to, err := timeout(az.ResourceTimeout, "azure")
+		if err != nil {
+			return nil, nil, err
+		}
+		arm := cloud.NewARM(az.BaseURL, az.Subscription, az.TokenCommand, to)
+		for k, v := range az.APIVersions {
+			arm.APIVersions[k] = v
+		}
+		for k, v := range az.WriteOnly {
+			arm.WriteOnly[k] = v
+		}
+		for _, t := range az.PutTypes {
+			arm.PutTypes[t] = true
+		}
+		ac := cloud.NewResources("azure", c.StateDir, arm)
+		ac.Shared = m.Store
+		m.Register(ac)
+	}
+	if g := c.GCP; len(g.Types) > 0 {
+		to, err := timeout(g.ResourceTimeout, "gcp")
+		if err != nil {
+			return nil, nil, err
+		}
+		for name, t := range g.Types {
+			if t.Collection == "" || (t.Update != "mask" && t.Update != "merge" && t.Update != "put") {
+				return nil, nil, fmt.Errorf("[gcp.types.%q]: collection and update (mask, merge or put) are required", name)
+			}
+		}
+		gc := cloud.NewResources("gcp", c.StateDir, cloud.NewGCP(g.Types, g.TokenCommand, to))
+		gc.Shared = m.Store
+		m.Register(gc)
+	}
 	if k := c.Kubernetes; k.Context != "" {
 		kc := kube.New()
 		kc.Context, kc.Environment = k.Context, k.Environment
@@ -357,6 +541,43 @@ registry:
 			kc.Namespace = k.Namespace
 		}
 		m.Register(kc)
+	}
+	for _, r := range c.PGGateways {
+		// the connector undo and restore use for this gateway's transactions (not a tool)
+		pc := postgres.New(r.Primary)
+		pc.ConnName, pc.Hide = "gw-"+r.Name, true
+		m.Register(pc)
+	}
+	for _, r := range c.MongoGateways {
+		m.Register(mongoconn.New("gw-"+r.Name, r.URI))
+	}
+	for _, r := range c.MySQLGateways {
+		a, err := mysqlconn.ParseURI(r.URI)
+		if err != nil {
+			return nil, nil, fmt.Errorf("[[mysql_gateway]] %s: %v", r.Name, err)
+		}
+		m.Register(mysqlconn.New("gw-"+r.Name, a))
+	}
+	for _, r := range c.Neo4jGateways {
+		u, err := url.Parse(r.URI)
+		if err != nil || u.Host == "" {
+			return nil, nil, fmt.Errorf("[[neo4j_gateway]] %s: uri is bolt://user:password@host:7687", r.Name)
+		}
+		pw, _ := u.User.Password()
+		m.Register(neo4jconn.New("gw-"+r.Name, "bolt://"+u.Host, u.User.Username(), pw))
+	}
+	for _, sv := range c.MCPServers {
+		if _, err := m.Connector(sv.Name); err == nil {
+			return nil, nil, fmt.Errorf("[[mcp_server]] %s: a connector of that name exists", sv.Name)
+		}
+		if len(sv.Command) > 0 && !filepath.IsAbs(sv.Command[0]) && strings.Contains(sv.Command[0], "/") {
+			sv.Command[0] = c.Abs(sv.Command[0])
+		}
+		pc, err := mcpproxy.New(sv, c.StateDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		m.Register(pc)
 	}
 	return m, fs, nil
 }

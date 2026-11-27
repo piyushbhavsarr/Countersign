@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"undolayer/internal/model"
+	"undolayer/internal/sqlshape"
 	"undolayer/internal/tx"
 )
 
@@ -60,6 +61,13 @@ func (s *Connector) Operations() map[string]tx.OpSchema {
 		"query": {Description: "Run a read-only SQL query (sees this transaction's staged writes).", Properties: p, Required: []string{"sql"}},
 		"execute": {Description: "Run SQL that writes. Staged inside the transaction; nothing is visible to others until commit. " +
 			"Transaction control (BEGIN/COMMIT) is managed for you.", Properties: p, Required: []string{"sql"}},
+		"restore_rows": {Description: "Put rows back as they were before an earlier task, without undoing the rest of it. " +
+			"Each row must still be as that task left it (on_conflict: fail, the default, or skip).",
+			Properties: map[string]any{"source_tx": map[string]any{"type": "string"},
+				"tables":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"keys":        map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+				"on_conflict": map[string]any{"type": "string", "enum": []any{"fail", "skip"}}},
+			Required: []string{"source_tx"}},
 	}
 }
 
@@ -102,8 +110,13 @@ func params(a map[string]any) []any {
 }
 
 func (s *Connector) Classify(t *tx.Tx, op string, args map[string]any) (model.Effect, model.Facts, error) {
+	if op == "restore_rows" {
+		return s.classifyRestore(t, args)
+	}
 	stmt, _ := args["sql"].(string)
 	base := model.Facts{"env": s.Env, "dialect": "sqlite"}
+	shape := sqlshape.Analyze(stmt)
+	base["query_shape"], base["sql_injection_signals"] = shape.Shape, shape.Signals
 	if parts := SplitStatements(stmt); len(parts) > 1 {
 		base["statements"], base["multi_statement"] = len(parts), true
 		return model.Reversible, base, nil
@@ -130,6 +143,7 @@ func (s *Connector) Classify(t *tx.Tx, op string, args map[string]any) (model.Ef
 	for k, v := range base {
 		facts[k] = v
 	}
+	facts["sql_injection_signals"] = injectionSignals(shape.Signals, facts)
 	unc := []string{}
 	if tw, ok := facts["tables_written"].([]string); ok {
 		for _, tname := range tw {
@@ -159,6 +173,9 @@ func display(row []Val, cols []string) map[string]any {
 }
 
 func (s *Connector) Stage(t *tx.Tx, a *model.Action) (any, error) {
+	if a.Operation == "restore_rows" {
+		return s.stageRestore(t, a)
+	}
 	stmt, _ := a.Args["sql"].(string)
 	if a.Facts["write_via_query"] == true {
 		return nil, errors.New("sql.query is read-only; use sql.execute for statements that write")
@@ -1171,3 +1188,32 @@ func (*Connector) NodeLocal() bool { return true }
 // Contained: staging runs inside a transaction this process holds (or a server-side dry
 // run); nothing reaches anyone else before commit.
 func (s *Connector) Contained(string) bool { return true }
+
+// SQLite functions that reach the file system or load code.
+var fileOrCode = map[string]bool{"load_extension": true, "readfile": true, "writefile": true, "edit": true,
+	"fsdir": true, "zipfile": true, "fts3_tokenizer": true}
+
+// injectionSignals adds what SQLite itself reported (functions called, catalog tables
+// read) to the structural signs from the statement's tokens.
+func injectionSignals(fromTokens []string, f model.Facts) []string {
+	set := map[string]bool{}
+	for _, x := range fromTokens {
+		set[x] = true
+	}
+	if fl, ok := f["functions"].([]string); ok {
+		for _, fn := range fl {
+			if fileOrCode[fn] {
+				set["file_or_program"] = true
+			}
+		}
+	}
+	if f["reads_catalog"] == true {
+		set["system_catalog"] = true
+	}
+	out := []string{}
+	for x := range set {
+		out = append(out, x)
+	}
+	sort.Strings(out)
+	return out
+}

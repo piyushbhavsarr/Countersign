@@ -93,6 +93,9 @@ func (s *Session) Tools() []tool {
 	}
 	sort.Strings(names)
 	for _, cn := range names {
+		if h, ok := conns[cn].(tx.Hidden); ok && h.Hidden() {
+			continue
+		}
 		ops := conns[cn].Operations()
 		opn := make([]string, 0, len(ops))
 		for o := range ops {
@@ -116,6 +119,9 @@ func (s *Session) Tools() []tool {
 func (s *Session) route(name string) (string, string, error) {
 	best := ""
 	for cn, c := range s.mgr.Connectors() {
+		if h, ok := c.(tx.Hidden); ok && h.Hidden() {
+			continue // never callable by an agent
+		}
 		if strings.HasPrefix(name, cn+"_") {
 			if _, ok := c.Operations()[name[len(cn)+1:]]; ok && len(cn) > len(best) {
 				best = cn

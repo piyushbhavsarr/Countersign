@@ -57,6 +57,7 @@ func (m *Manager) SignDecision(t *Tx, actionID, decision, reviewer, keyPath stri
 	}
 	var subject string
 	var check func() review.Outcome
+	var shown func() any // what the reviewer decided on, kept as evidence
 	if actionID != "" {
 		var a *model.Action
 		for _, x := range t.Actions {
@@ -68,9 +69,11 @@ func (m *Manager) SignDecision(t *Tx, actionID, decision, reviewer, keyPath stri
 			return review.Outcome{}, fmt.Errorf("no action %s in %s", actionID, t.ID)
 		}
 		subject, check = review.ActionSubject(a), func() review.Outcome { return t.actionOutcome(a) }
+		shown = func() any { return actionEvidence(a) }
 	} else {
 		h := t.PreviewHash()
 		subject, check = review.CommitSubject(h), func() review.Outcome { return t.commitOutcome(h, 0) }
+		shown = func() any { return t.Preview() }
 	}
 	st := review.Statement{V: 1, Tx: t.ID, Subject: subject, Decision: decision, Reviewer: reviewer, TS: model.Now()}
 	sig, err := review.Sign(keyPath, st)
@@ -84,5 +87,13 @@ func (m *Manager) SignDecision(t *Tx, actionID, decision, reviewer, keyPath stri
 		return review.Outcome{}, err
 	}
 	m.audit("signed_decision", map[string]any{"tx": t.ID, "subject": subject, "decision": decision, "reviewer": reviewer})
+	m.recordEvidence(t, kindOf(actionID), subject, decision, reviewer, shown())
 	return check(), nil
+}
+
+func kindOf(actionID string) string {
+	if actionID != "" {
+		return "action"
+	}
+	return "commit"
 }

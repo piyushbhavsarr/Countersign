@@ -7,6 +7,15 @@
 //	undolayer recover | worker [--once] | audit
 //	undolayer registry test|list <path>
 //	undolayer hook claude-code | setup claude-code
+//	undolayer evidence <tx> [--out evidence.json]   everything about a task, as JSON
+//	undolayer risk train [--data examples.jsonl] [--out risk-model.json] | risk explain <tx>
+//	undolayer changes <tx> [--table T] [--op delete] [--format json|csv|sql] [--out file]
+//	undolayer restore <tx> [--table T] [--key '{"id":42}'] [--on-conflict skip] [--dry-run] [--yes]
+//	undolayer revert --requester NAME [--since 2h] [--until TIME] [--dry-run] [--yes]
+//	undolayer vault check | repair | keys | rotate-key | shred-key <id>
+//	undolayer freeze <requester> [--reason TEXT] | unfreeze <requester> | frozen
+//	undolayer mcp list | pin <server>
+//	undolayer gateway -c undolayer.toml          serve every [[pg_gateway]] (PostgreSQL protocol)
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
 
@@ -39,17 +48,25 @@ import (
 	"undolayer/internal/mcp"
 	"undolayer/internal/registry"
 	"undolayer/internal/review"
+	"undolayer/internal/risk"
 	rt "undolayer/internal/runtime"
 	"undolayer/internal/sandbox"
 	"undolayer/internal/tx"
+	"undolayer/internal/vault"
 )
 
 const version = "0.3.0"
 
 var jsonOut *bool
 
+// loaded is the manager of this run, flushed before the process exits.
+var loaded *tx.Manager
+
 func die(err error) {
 	fmt.Fprintln(os.Stderr, "undolayer:", err)
+	if loaded != nil {
+		_ = loaded.Flush()
+	}
 	os.Exit(1)
 }
 
@@ -68,10 +85,16 @@ func load(cfgPath string) (*rt.Config, *tx.Manager) {
 	if err != nil {
 		die(err)
 	}
+	loaded = m
 	return c, m
 }
 
 func main() {
+	defer func() {
+		if loaded != nil {
+			_ = loaded.Flush()
+		}
+	}()
 	egress.MaybeNetinit()
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: undolayer <run|serve|connect|list|show|approve|rollback|undo|recover|worker|audit|registry|hook|setup|bench> ...")
@@ -99,10 +122,10 @@ func main() {
 		if err := integrations.Hook(os.Stdin, os.Stdout, cfg); err != nil {
 			die(err)
 		}
-	case "aws":
+	case "aws", "azure", "gcp":
 		parseArgs(fs, args)
 		if fs.Arg(0) != "verify" || fs.Arg(1) == "" {
-			die(errors.New("usage: undolayer aws verify <AWS::Type> --desired '<properties JSON>' --patch '<JSON Patch>' -c undolayer.toml\n" +
+			die(errors.New("usage: undolayer aws|azure|gcp verify <type> --desired '<properties JSON>' --patch '<JSON Patch>' -c undolayer.toml\n" +
 				"  Creates a resource of that type in your account, updates it, undoes the update, checks the properties\n" +
 				"  are back, and deletes it. Use a sandbox account. On success the type's changes become undoable."))
 		}
@@ -123,9 +146,10 @@ func main() {
 			die(errors.New("both --desired and --patch are required"))
 		}
 		_, m := load(*cfgPath)
-		c, err := m.Connector("cloud")
+		name := map[string]string{"aws": "cloud", "azure": "azure", "gcp": "gcp"}[cmd]
+		c, err := m.Connector(name)
 		if err != nil {
-			die(err)
+			die(fmt.Errorf("[%s] is not configured", cmd))
 		}
 		cl := c.(*cloud.Connector)
 		if cl.CC == nil {
@@ -135,6 +159,58 @@ func main() {
 			die(fmt.Errorf("FAIL %s: %v", fs.Arg(1), err))
 		}
 		fmt.Printf("PASS %s: create, update, undo and delete round trip; its changes are now undoable\n", fs.Arg(1))
+		return
+	case "evidence":
+		parseArgs(fs, args)
+		if fs.Arg(0) == "" {
+			die(errors.New("usage: undolayer evidence <tx> [--out evidence.json] -c undolayer.toml"))
+		}
+		_, m := load(*cfgPath)
+		t, err := m.Get(fs.Arg(0))
+		if err != nil {
+			die(err)
+		}
+		rep, err := m.EvidenceReport(t)
+		if err != nil {
+			die(err)
+		}
+		rest := fs.Args()[1:]
+		for i := 0; i+1 < len(rest); i++ {
+			if rest[i] == "--out" {
+				b, _ := json.MarshalIndent(rep, "", "  ")
+				if err := os.WriteFile(rest[i+1], append(b, '\n'), 0o600); err != nil {
+					die(err)
+				}
+				fmt.Printf("evidence for %s written to %s\n", t.ID, rest[i+1])
+				return
+			}
+		}
+		out(rep)
+		return
+	case "risk":
+		parseArgs(fs, args)
+		riskCmd(*cfgPath, fs.Args())
+		return
+	case "mcp":
+		parseArgs(fs, args)
+		_, m := load(*cfgPath)
+		mcpCmd(m, fs.Args())
+		return
+	case "gateway":
+		parseArgs(fs, args)
+		c, m := load(*cfgPath)
+		gatewayCmd(c, m)
+		return
+	case "freeze", "unfreeze", "frozen":
+		parseArgs(fs, args)
+		_, m := load(*cfgPath)
+		freezeCmd(m, cmd, fs.Args())
+		return
+	case "changes", "restore", "revert", "vault":
+		parseArgs(fs, args)
+		_, m := load(*cfgPath)
+		map[string]func(*tx.Manager, []string){"changes": changesCmd, "restore": restoreCmd, "revert": revertCmd,
+			"vault": vaultCmd}[cmd](m, fs.Args())
 		return
 	case "reviewer":
 		parseArgs(fs, args)
@@ -242,8 +318,12 @@ func main() {
 		}
 		stop := make(chan struct{})
 		go mcp.Worker(m, 5*time.Second, stop)
+		if m.Vault != nil {
+			m.Vault.StartArchiver(stop, nil)
+		}
 		mcp.NewSession(m, version).Serve(os.Stdin, os.Stdout)
 		close(stop)
+		_ = m.Flush()
 	case "run":
 		parseArgs(fs, args)
 		runAgent(*cfgPath, fs.Args())
@@ -351,6 +431,15 @@ func manage(cmd, cfgPath string, fs *flag.FlagSet) {
 		for _, a := range fs.Args() {
 			once = once || a == "--once"
 		}
+		stopArch := make(chan struct{})
+		defer close(stopArch)
+		if m.Vault != nil {
+			m.Vault.StartArchiver(stopArch, func(r *vault.ArchiveReport, err error) {
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "vault archive:", err)
+				}
+			})
+		}
 		for {
 			r := map[string]any{"recovered": m.Recover(), "released": m.FlushDue()}
 			out(r)
@@ -372,6 +461,15 @@ func manage(cmd, cfgPath string, fs *flag.FlagSet) {
 		die(fmt.Errorf("usage: undolayer %s <tx>", cmd))
 	}
 	t, err := m.Get(fs.Arg(0))
+	if err != nil && cmd == "undo" && m.Vault != nil {
+		// a task known only from the vault (a gateway transaction)
+		r, verr := m.UndoFromVault(fs.Arg(0))
+		if verr != nil {
+			die(fmt.Errorf("%v (and from the vault: %v)", err, verr))
+		}
+		out(r)
+		return
+	}
 	if err != nil {
 		die(err)
 	}
@@ -687,4 +785,103 @@ func parseArgs(fs *flag.FlagSet, args []string) {
 		}
 	}
 	_ = fs.Parse(append(known, append([]string{"--"}, rest...)...))
+}
+
+// riskCmd trains the risk model from reviewer decisions, or explains a task's scores.
+func riskCmd(cfgPath string, args []string) {
+	usage := errors.New("usage: undolayer risk train [--data examples.jsonl] [--out risk-model.json] [--epochs N] -c undolayer.toml\n" +
+		"       undolayer risk explain <tx> [--model risk-model.json] -c undolayer.toml")
+	if len(args) == 0 {
+		die(usage)
+	}
+	opt := func(name string) string {
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == name {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	c, m := load(cfgPath)
+	switch args[0] {
+	case "train":
+		examples, err := m.ReviewedExamples()
+		if err != nil {
+			die(err)
+		}
+		fromAudit := len(examples)
+		if f := opt("--data"); f != "" {
+			more, err := readExamples(f)
+			if err != nil {
+				die(err)
+			}
+			examples = append(examples, more...)
+		}
+		epochs, _ := strconv.Atoi(opt("--epochs"))
+		model, err := risk.Train(examples, risk.Options{Epochs: epochs})
+		if err != nil {
+			die(fmt.Errorf("%v (%d examples: %d from reviewer decisions in the audit log)", err, len(examples), fromAudit))
+		}
+		dest := opt("--out")
+		if dest == "" {
+			dest = c.Abs("risk-model.json")
+		}
+		if err := model.Save(dest); err != nil {
+			die(err)
+		}
+		out(map[string]any{"model": dest, "examples": len(examples), "from_reviewer_decisions": fromAudit,
+			"risky": model.Positives, "training_accuracy": model.Accuracy(examples, 0.5),
+			"next": "set [risk] model = \"" + dest + "\" and add a rule on risk_score, e.g. when = { risk_score = { gt = 0.85 } }"})
+	case "explain":
+		if len(args) < 2 {
+			die(usage)
+		}
+		rm := m.Policy.Risk
+		if f := opt("--model"); f != "" {
+			var err error
+			if rm, err = risk.Load(f); err != nil {
+				die(err)
+			}
+		}
+		if rm == nil {
+			die(errors.New("no model: set [risk] model in the config, or pass --model"))
+		}
+		t, err := m.Get(args[1])
+		if err != nil {
+			die(err)
+		}
+		rows := []map[string]any{}
+		for _, a := range t.Actions {
+			score, signals := rm.Score(a)
+			rows = append(rows, map[string]any{"action": a.ID, "call": a.Connector + "." + a.Operation,
+				"decision": a.Decision, "risk_score": score, "because": signals})
+		}
+		out(map[string]any{"tx": t.ID, "task": t.Task, "actions": rows})
+	default:
+		die(usage)
+	}
+}
+
+// readExamples reads JSON lines of {"action": {...}, "label": 0|1}.
+func readExamples(path string) ([]risk.Example, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []risk.Example
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	for n := 1; sc.Scan(); n++ {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var e risk.Example
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			return nil, fmt.Errorf("%s:%d: %v", path, n, err)
+		}
+		out = append(out, e)
+	}
+	return out, sc.Err()
 }

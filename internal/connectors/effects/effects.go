@@ -11,16 +11,21 @@
 package effects
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"undolayer/internal/connectors/api"
 	"undolayer/internal/creds"
 	"undolayer/internal/model"
+	"undolayer/internal/netguard"
 	"undolayer/internal/taint"
 	"undolayer/internal/tx"
 )
@@ -33,13 +38,38 @@ type HTTP struct {
 	Transport      api.Transport
 	AllowHosts     []string
 	AllowedHeaders []string
+	// AllowPrivateHosts: hosts (globs) the agent may reach on loopback, private or
+	// link-local networks. Cloud metadata services are never reachable.
+	AllowPrivateHosts []string
+	guarded           bool // the real network: every connection is checked where it is dialled
 }
 
 func NewHTTP(c creds.Store, tr api.Transport) *HTTP {
+	h := &HTTP{Base: tx.Base{ConnName: "http"}, Creds: c, Transport: tr, AllowedHeaders: []string{"accept", "content-type"}}
 	if tr == nil {
-		tr = api.HTTPTransport
+		h.guarded = true
+		h.Transport = func(method, u string, headers map[string]string, body []byte) (int, []byte, error) {
+			return guardedSend(netguard.Client(30*time.Second, h.AllowPrivateHosts), method, u, headers, body)
+		}
 	}
-	return &HTTP{Base: tx.Base{ConnName: "http"}, Creds: c, Transport: tr, AllowedHeaders: []string{"accept", "content-type"}}
+	return h
+}
+
+func guardedSend(cl *http.Client, method, u string, headers map[string]string, body []byte) (int, []byte, error) {
+	req, err := http.NewRequest(method, u, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	return resp.StatusCode, b, err
 }
 
 func (*HTTP) Egress() bool { return true }
@@ -90,6 +120,15 @@ func (h *HTTP) Classify(t *tx.Tx, op string, args map[string]any) (model.Effect,
 		}
 	}
 	f := model.Facts{"method": method, "host": host, "agent_headers": bad, "host_allowed": allowed}
+	hdrs := map[string]string{}
+	if hd, ok := args["headers"].(map[string]any); ok {
+		for k, v := range hd {
+			hdrs[k] = fmt.Sprint(v)
+		}
+	}
+	uf := netguard.Inspect(method, fmt.Sprint(args["url"]), hdrs, h.AllowPrivateHosts)
+	f["url_scheme"], f["destination_network"], f["destination_private_allowed"] = uf.Scheme, uf.Network, uf.PrivateAllowed
+	f["url_userinfo"], f["header_injection"], f["request_shape"] = uf.UserInfo, uf.HeaderInjection, uf.Shape
 	if safeMethods[method] {
 		return model.Read, f, nil
 	}

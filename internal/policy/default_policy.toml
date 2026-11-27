@@ -127,11 +127,78 @@ decision = "deny"
 reason = "The agent may not set its own headers (credentials are injected by the gateway)"
 
 [[rule]]
+id = "http-metadata-service"
+connector = "http"
+when = { destination_network = "metadata" }
+decision = "deny"
+reason = "Cloud metadata services (169.254.169.254, metadata.google.internal, ...) hand out the machine's own credentials"
+
+[[rule]]
+id = "http-private-network"
+connector = "http"
+when = { destination_network = { in = ["loopback", "link_local", "private"] }, destination_private_allowed = false }
+decision = "deny"
+reason = "The address is on this machine or a private network (SSRF); the operator can allow a host in [http] allow_private_hosts"
+
+[[rule]]
+id = "http-scheme"
+connector = "http"
+when = { url_scheme = { in = ["file", "gopher", "ftp", "dict", "ldap", "jar", "data", "invalid", ""] } }
+decision = "deny"
+reason = "Only http and https URLs are sent"
+
+[[rule]]
+id = "http-userinfo"
+connector = "http"
+when = { url_userinfo = true }
+decision = "deny"
+reason = "Credentials written into a URL (user:password@host) are not passed on; use a delegated credential"
+
+[[rule]]
+id = "http-header-injection"
+connector = "http"
+when = { header_injection = true }
+decision = "deny"
+reason = "A line break in the URL or a header would let the request carry headers or requests of its own"
+
+[[rule]]
 id = "http-undeclared-host"
 connector = "http"
 when = { host_allowed = false }
 decision = "deny"
 reason = "Host is not covered by any delegated credential or allow-list"
+
+# ---------------------------------------------------------------- Cloud resources (AWS, Azure, Google Cloud)
+[[rule]]
+id = "cloud-public-exposure"
+when = { public_exposure = { exists = true, ne = [] } }
+decision = "require_approval"
+reason = "This opens the resource to the whole internet (0.0.0.0/0, a * or Internet source, or public access turned on)"
+
+# ---------------------------------------------------------------- Tools on other MCP servers
+[[rule]]
+id = "mcp-tool-changed"
+when = { tool_changed = true }
+decision = "deny"
+reason = "This tool's definition changed since it was pinned (a server can rewrite a tool to steer agents); an operator must review it: undolayer mcp pin <server>"
+
+[[rule]]
+id = "mcp-tool-unpinned"
+when = { tool_pinned = false }
+decision = "deny"
+reason = "This tool appeared after the server was pinned; an operator must review it: undolayer mcp pin <server>"
+
+[[rule]]
+id = "url-args-metadata"
+when = { url_args_network = "metadata" }
+decision = "deny"
+reason = "An argument points at a cloud metadata service, which hands out the machine's own credentials"
+
+[[rule]]
+id = "url-args-private"
+when = { url_args_network = { in = ["loopback", "link_local", "private"] }, url_args_private_allowed = false }
+decision = "deny"
+reason = "An argument points at this machine or a private network (SSRF); the operator can allow the host for this server"
 
 # ---------------------------------------------------------------- Messaging
 [[rule]]
@@ -237,6 +304,44 @@ connector = "sql"
 when = { unknown_statement = true }
 decision = "require_approval"
 reason = "Statement type the runtime does not model"
+
+# ---------------------------------------------------------------- SQL injection
+# From the statement's structure (PostgreSQL's parse tree; SQLite's tokens) and from what
+# the database reports (functions called, catalog tables read), never from searching the
+# text for attack strings. Signals: or_tautology, trailing_comment, comment, union, stacked,
+# system_catalog, time_delay, file_or_program. Each SQL action also carries query_shape and
+# shape_new (its requester never committed a query of this shape). Signals that legitimate
+# queries also produce (union, comment, system_catalog) have no default rule; a gateway in
+# front of an application, whose queries repeat, can add one, e.g.
+#   when = { shape_new = true, sql_injection_signals = { in = ["union", "trailing_comment"] } }
+[[rule]]
+id = "sql-injection-or-tautology-read"
+connector = "sql"
+effect = ["read"]
+when = { sql_injection_signals = { in = ["or_tautology"] } }
+decision = "deny"
+reason = "An always-true OR condition (OR 1=1, OR 'a'='a', OR true) is how injected input widens a query to every row; a read would return the data at once, so it does not run"
+
+[[rule]]
+id = "sql-injection-or-tautology-write"
+connector = "sql"
+when = { sql_injection_signals = { in = ["or_tautology"] } }
+decision = "require_approval"
+reason = "An always-true OR condition (OR 1=1, OR 'a'='a', OR true) makes the statement touch every row; it is staged and measured, and a human must approve it"
+
+[[rule]]
+id = "sql-time-delay"
+connector = "sql"
+when = { sql_injection_signals = { in = ["time_delay"] } }
+decision = "deny"
+reason = "pg_sleep and its kin are how blind SQL injection reads data one timing at a time, and they hold connections and locks"
+
+[[rule]]
+id = "sql-file-or-program"
+connector = "sql"
+when = { sql_injection_signals = { in = ["file_or_program"] } }
+decision = "deny"
+reason = "The statement reads or writes server files, loads code or opens connections to other databases (pg_read_file, lo_export, dblink, load_extension, readfile)"
 
 [[rule]]
 id = "sql-schema-unsupported"

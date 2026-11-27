@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -40,6 +41,16 @@ var privilegeNodes = map[string]bool{"GrantStmt": true, "GrantRoleStmt": true, "
 	"DropRoleStmt": true, "AlterRoleSetStmt": true, "ReassignOwnedStmt": true, "AlterOwnerStmt": true}
 var additiveDDL = map[string]bool{"CreateStmt": true, "IndexStmt": true, "ViewStmt": true, "CreateTableAsStmt": true, "CreateSeqStmt": true}
 var readTop = map[string]bool{"SelectStmt": true, "VariableShowStmt": true, "ExplainStmt": true}
+
+// views and functions that show or act on other sessions
+var sessionViews = map[string]bool{"pg_stat_activity": true, "pg_stat_statements": true, "pg_stat_statements_info": true,
+	"pg_locks": true, "pg_blocking_pids": true, "pg_prepared_xacts": true, "pg_stat_replication": true, "pg_stat_ssl": true,
+	"pg_stat_gssapi": true, "pg_stat_progress_vacuum": true, "pg_stat_progress_copy": true, "pg_stat_progress_create_index": true}
+
+var sessionFuncs = map[string]bool{"pg_cancel_backend": true, "pg_terminate_backend": true, "pg_stat_get_activity": true,
+	"pg_stat_get_backend_activity": true, "pg_stat_get_backend_pid": true, "pg_stat_get_backend_idset": true,
+	"pg_stat_statements": true, "pg_stat_statements_reset": true, "pg_blocking_pids": true, "pg_safe_snapshot_blocking_pids": true,
+	"pg_log_backend_memory_contexts": true, "pg_signal_backend": true}
 
 func walk(v any, fn func(key string, node map[string]any)) {
 	switch x := v.(type) {
@@ -66,8 +77,153 @@ func relName(n map[string]any) string {
 	return name
 }
 
-// Analyze turns one statement's parse tree into policy facts.
+var pgDelay = map[string]bool{"pg_sleep": true, "pg_sleep_for": true, "pg_sleep_until": true}
+
+var pgFileOrProgram = map[string]bool{"pg_read_file": true, "pg_read_binary_file": true, "pg_ls_dir": true,
+	"pg_stat_file": true, "lo_import": true, "lo_export": true, "pg_ls_logdir": true, "pg_ls_waldir": true}
+
+// alwaysTrue: an OR operand that is true by its own text: a true constant, or two equal
+// constants (or one column) compared for equality.
+func alwaysTrue(n map[string]any) bool {
+	if c, ok := n["A_Const"].(map[string]any); ok {
+		if b, ok := c["boolval"].(map[string]any); ok {
+			return b["boolval"] == true
+		}
+		if iv, ok := c["ival"].(map[string]any); ok {
+			return iv["ival"] != nil && fmt.Sprint(iv["ival"]) != "0"
+		}
+		return false
+	}
+	if tc, ok := n["TypeCast"].(map[string]any); ok {
+		if arg, ok := tc["arg"].(map[string]any); ok {
+			if c, ok := arg["A_Const"].(map[string]any); ok {
+				if sv, ok := c["sval"].(map[string]any); ok {
+					v := strings.ToLower(fmt.Sprint(sv["sval"]))
+					return v == "t" || v == "true" || v == "y" || v == "yes" || v == "on" || v == "1"
+				}
+			}
+		}
+		return false
+	}
+	e, ok := n["A_Expr"].(map[string]any)
+	if !ok || e["kind"] != "AEXPR_OP" {
+		return false
+	}
+	names, _ := e["name"].([]any)
+	op := ""
+	if len(names) == 1 {
+		if sv, ok := names[0].(map[string]any)["String"].(map[string]any); ok {
+			op = fmt.Sprint(sv["sval"])
+		}
+	}
+	if op != "=" && op != "<=" && op != ">=" {
+		return false
+	}
+	l, _ := e["lexpr"].(map[string]any)
+	r, _ := e["rexpr"].(map[string]any)
+	_, lc := l["A_Const"]
+	_, rc := r["A_Const"]
+	_, lcol := l["ColumnRef"]
+	_, rcol := r["ColumnRef"]
+	if !(lc && rc) && !(lcol && rcol) {
+		return false
+	}
+	return canonNode(l) == canonNode(r)
+}
+
+// canonNode: a node's JSON without source positions.
+func canonNode(n map[string]any) string {
+	var strip func(any) any
+	strip = func(v any) any {
+		switch x := v.(type) {
+		case map[string]any:
+			o := map[string]any{}
+			for k, e := range x {
+				if k != "location" {
+					o[k] = strip(e)
+				}
+			}
+			return o
+		case []any:
+			o := make([]any, len(x))
+			for i, e := range x {
+				o[i] = strip(e)
+			}
+			return o
+		}
+		return v
+	}
+	b, _ := json.Marshal(strip(n))
+	return string(b)
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := []string{}
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// analyzeCache: a bounded cache of Analyze results by statement text. When full it starts
+// over (simple, and an application's working set of statements is small).
+type factCache struct {
+	mu sync.Mutex
+	m  map[string]model.Facts
+}
+
+var analyzeCache = &factCache{m: map[string]model.Facts{}}
+
+const analyzeCacheSize = 8192
+
+func (c *factCache) get(sql string) (model.Facts, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f, ok := c.m[sql]
+	if !ok {
+		return nil, false
+	}
+	return copyFacts(f), true
+}
+
+func (c *factCache) put(sql string, f model.Facts) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.m) >= analyzeCacheSize {
+		c.m = map[string]model.Facts{}
+	}
+	c.m[sql] = copyFacts(f)
+}
+
+// copyFacts: callers add to and change the facts they get; the cached copy stays as it was.
+func copyFacts(f model.Facts) model.Facts {
+	out := model.Facts{}
+	for k, v := range f {
+		if l, ok := v.([]string); ok {
+			v = append([]string{}, l...)
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// Analyze turns one statement's parse tree into policy facts. It is a pure function of the
+// text, so results are cached by text: an application repeats the same statements (with
+// parameters) millions of times, and each is parsed once.
 func Analyze(sql string) (model.Facts, error) {
+	if f, ok := analyzeCache.get(sql); ok {
+		return f, nil
+	}
+	f, err := analyze(sql)
+	if err != nil {
+		return nil, err
+	}
+	analyzeCache.put(sql, f)
+	return copyFacts(f), nil
+}
+
+func analyze(sql string) (model.Facts, error) {
 	js, err := pg_query.ParseToJSON(sql)
 	if err != nil {
 		return nil, err
@@ -78,6 +234,25 @@ func Analyze(sql string) (model.Facts, error) {
 	}
 	stmts, _ := tree["stmts"].([]any)
 	f := model.Facts{"statements": len(stmts)}
+	others, capture := false, false
+	sigs := map[string]bool{}
+	if fp, err := pg_query.Fingerprint(sql); err == nil {
+		f["query_shape"] = fp
+	}
+	if sc, err := pg_query.Scan(sql); err == nil {
+		for i, tk := range sc.Tokens {
+			if tk.Token == pg_query.Token_SQL_COMMENT || tk.Token == pg_query.Token_C_COMMENT {
+				sigs["comment"] = true
+				if i == len(sc.Tokens)-1 && tk.Token == pg_query.Token_SQL_COMMENT && i > 0 {
+					sigs["trailing_comment"] = true
+				}
+			}
+		}
+	}
+	if len(stmts) > 1 {
+		sigs["stacked"] = true
+	}
+	defer func() { f["sql_injection_signals"] = sortedKeys(sigs) }()
 	if len(stmts) != 1 {
 		return f, nil
 	}
@@ -92,6 +267,33 @@ func Analyze(sql string) (model.Facts, error) {
 	ctrl, set, copyExt, opaque, priv, destroys, renames, unsupported, additive := false, []string{}, false, false, false, false, false, false, false
 	analyzeExplain := false
 	walk(stmt, func(k string, n map[string]any) {
+		switch k {
+		case "BoolExpr":
+			if n["boolop"] == "OR_EXPR" {
+				args, _ := n["args"].([]any)
+				for _, a := range args {
+					if am, ok := a.(map[string]any); ok && alwaysTrue(am) {
+						sigs["or_tautology"] = true
+					}
+				}
+			}
+		case "SelectStmt":
+			if op, _ := n["op"].(string); op == "SETOP_UNION" {
+				sigs["union"] = true
+			}
+		case "RangeVar", "relation":
+			schema, _ := n["schemaname"].(string)
+			name, _ := n["relname"].(string)
+			if schema == "pg_catalog" || schema == "information_schema" || (schema == "" && strings.HasPrefix(name, "pg_")) {
+				sigs["system_catalog"] = true
+			}
+			if sessionViews[name] {
+				others = true
+			}
+			if schema == "undolayer" {
+				capture = true
+			}
+		}
 		if kind, ok := dataNodes[k]; ok {
 			writes[relName(n)] = true
 			_ = kind
@@ -177,6 +379,33 @@ func Analyze(sql string) (model.Facts, error) {
 	}
 	sort.Strings(fl)
 	f["tables_written"], f["functions"] = tl, fl
+	for _, fn := range fl {
+		if sessionFuncs[fn[strings.LastIndex(fn, ".")+1:]] {
+			others = true
+		}
+	}
+	// what other sessions run and hold (through a gateway every client is the same database
+	// user, so these would show one client another's statements, with their values)
+	f["other_sessions"] = others
+	for _, fn := range fl {
+		if strings.HasPrefix(fn, "undolayer.") {
+			capture = true
+		}
+	}
+	// the capture schema: the outbox holds every gateway client's before states
+	f["touches_capture"] = capture
+	for _, fn := range fl {
+		base := fn[strings.LastIndex(fn, ".")+1:]
+		switch {
+		case pgDelay[base]:
+			sigs["time_delay"] = true
+		case pgFileOrProgram[base] || strings.HasPrefix(base, "dblink"):
+			sigs["file_or_program"] = true
+		}
+	}
+	if copyExt {
+		sigs["file_or_program"] = true
+	}
 	f["transaction_control"], f["pragma_set"], f["copy_external"], f["opaque_code"] = ctrl, set, copyExt, opaque
 	f["privilege_change"], f["destroys_schema"], f["renames_schema"], f["schema_unsupported"] = priv, destroys, renames, unsupported
 	f["schema_change"] = additive || destroys || renames || unsupported
@@ -226,6 +455,8 @@ type UndoRecord struct {
 
 type Connector struct {
 	tx.Base
+	// Hide: not offered to agents as tools (a gateway's: only undo and restore use it).
+	Hide            bool
 	DSN             string
 	Env             string
 	FractionMinRows int64
@@ -242,6 +473,13 @@ func (c *Connector) Operations() map[string]tx.OpSchema {
 		"query": {Description: "Run a read-only SQL query (sees this transaction's staged writes).", Properties: p, Required: []string{"sql"}},
 		"execute": {Description: "Run SQL that writes. Staged inside the transaction; nothing is visible to others until commit. " +
 			"Transaction control (BEGIN/COMMIT) is managed for you.", Properties: p, Required: []string{"sql"}},
+		"restore_rows": {Description: "Put rows back as they were before an earlier task, without undoing the rest of it. " +
+			"Each row must still be as that task left it (on_conflict: fail, the default, or skip).",
+			Properties: map[string]any{"source_tx": map[string]any{"type": "string"},
+				"tables":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"keys":        map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+				"on_conflict": map[string]any{"type": "string", "enum": []any{"fail", "skip"}}},
+			Required: []string{"source_tx"}},
 	}
 }
 
@@ -424,6 +662,9 @@ func params(a map[string]any) []any {
 }
 
 func (c *Connector) Classify(t *tx.Tx, op string, args map[string]any) (model.Effect, model.Facts, error) {
+	if op == "restore_rows" {
+		return c.classifyRestore(t, args)
+	}
 	sql, _ := args["sql"].(string)
 	f, err := Analyze(sql)
 	base := model.Facts{"env": c.Env, "dialect": "postgres"}
@@ -492,6 +733,9 @@ func display(rows pgx.Rows) ([]any, error) {
 }
 
 func (c *Connector) Stage(t *tx.Tx, a *model.Action) (any, error) {
+	if a.Operation == "restore_rows" {
+		return c.stageRestore(t, a)
+	}
 	sql, _ := a.Args["sql"].(string)
 	if e, ok := a.Facts["compile_error"].(string); ok {
 		return nil, errors.New(e)
@@ -830,6 +1074,53 @@ func (c *Connector) Preview(t *tx.Tx) map[string]any {
 	return map[string]any{"database": redact(c.DSN), "env": c.Env, "statements": stmts}
 }
 
+// Hidden: see tx.Hidden.
+func (c *Connector) Hidden() bool { return c.Hide }
+
+// RecordDSN is the database name written into undo records made for this connector by
+// others (the gateway): the DSN without its password, which stays in the configuration.
+func (c *Connector) RecordDSN() string { return redact(c.DSN) }
+
+// dsnOf: the DSN to connect with for a recorded one (the password comes from here).
+func (c *Connector) dsnOf(recorded string) string {
+	if recorded == redact(c.DSN) {
+		return c.DSN
+	}
+	return recorded
+}
+
+// sameDB: a record names this connector's database.
+func (c *Connector) sameDB(recorded string) bool {
+	return recorded == c.DSN || recorded == redact(c.DSN)
+}
+
+// ResolveInFlight tells, for a record whose commit may not have happened (written before
+// COMMIT, by the gateway), whether the server committed it: from txid_status.
+func (c *Connector) ResolveInFlight(raw json.RawMessage) (committed, known bool, err error) {
+	var rec UndoRecord
+	if err := json.Unmarshal(raw, &rec); err != nil || rec.XID == 0 {
+		return false, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, c.dsnOf(rec.DSN))
+	if err != nil {
+		return false, false, err
+	}
+	defer conn.Close(ctx)
+	var status *string
+	if err := conn.QueryRow(ctx, "SELECT txid_status($1)", rec.XID).Scan(&status); err != nil {
+		return false, false, err
+	}
+	if status == nil || *status == "in progress" {
+		return false, false, nil
+	}
+	return *status == "committed", true, nil
+}
+
+// KeyOf is a row's primary key, as captured (exported for the gateway).
+func KeyOf(row string, pk []string) string { return keyOf(row, pk) }
+
 func redact(dsn string) string {
 	if i := strings.Index(dsn, "://"); i >= 0 {
 		if j := strings.Index(dsn[i+3:], "@"); j >= 0 {
@@ -930,7 +1221,7 @@ func (c *Connector) UndoInFlight(raw json.RawMessage) error {
 		return nil
 	}
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, rec.DSN)
+	conn, err := pgx.Connect(ctx, c.dsnOf(rec.DSN))
 	if err != nil {
 		return err
 	}
@@ -973,7 +1264,7 @@ func (c *Connector) Undo(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &rec); err != nil {
 		return err
 	}
-	l, err := open(rec.DSN, "undo", true)
+	l, err := open(c.dsnOf(rec.DSN), "undo", true)
 	if err != nil {
 		return err
 	}

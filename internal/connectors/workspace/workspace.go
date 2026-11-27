@@ -116,6 +116,12 @@ func (w *FS) Operations() map[string]tx.OpSchema {
 		"delete": {Description: "Delete a file or directory (staged).", Properties: p, Required: []string{"path"}},
 		"move": {Description: "Move/rename (staged).", Properties: map[string]any{"src": map[string]any{"type": "string"}, "dst": map[string]any{"type": "string"}},
 			Required: []string{"src", "dst"}},
+		"restore_files": {Description: "Put files back as they were before an earlier task, without undoing the rest of it. " +
+			"Each file must still be as that task left it (on_conflict: fail, the default, or skip).",
+			Properties: map[string]any{"source_tx": map[string]any{"type": "string"},
+				"paths":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"on_conflict": map[string]any{"type": "string", "enum": []any{"fail", "skip"}}},
+			Required: []string{"source_tx"}},
 	}
 }
 
@@ -167,6 +173,9 @@ func paths(args map[string]any) []string {
 }
 
 func (w *FS) Classify(t *tx.Tx, op string, args map[string]any) (model.Effect, model.Facts, error) {
+	if op == "restore_files" {
+		return w.classifyRestore(t, args)
+	}
 	ps := paths(args)
 	inside := true
 	for _, p := range ps {
@@ -507,6 +516,9 @@ func (w *FS) Stage(t *tx.Tx, a *model.Action) (any, error) {
 	shadow, err := w.Shadow(t)
 	if err != nil {
 		return nil, err
+	}
+	if a.Operation == "restore_files" {
+		return w.stageRestore(t, a)
 	}
 	str := func(k string) string { s, _ := a.Args[k].(string); return s }
 	var p string
@@ -860,13 +872,17 @@ func (w *FS) Commit(t *tx.Tx) (any, error) {
 		if contains(c.Added, rel) {
 			kind = "added"
 		}
-		rec.Entries = append(rec.Entries, UndoEntry{Path: rel, Kind: kind, After: entry(dst)})
+		e := UndoEntry{Path: rel, Kind: kind, After: entry(dst)}
+		if kind == "modified" {
+			e.Before = st.Manifest[rel] // what the file was: restore checks the bytes it puts back against it
+		}
+		rec.Entries = append(rec.Entries, e)
 	}
 	for _, rel := range c.Deleted {
 		if err := os.Remove(filepath.Join(w.Root, rel)); err != nil {
 			return nil, err
 		}
-		rec.Entries = append(rec.Entries, UndoEntry{Path: rel, Kind: "deleted"})
+		rec.Entries = append(rec.Entries, UndoEntry{Path: rel, Kind: "deleted", Before: st.Manifest[rel]})
 		prune(filepath.Join(w.Root, rel), w.Root)
 	}
 	_ = os.RemoveAll(filepath.Dir(st.Shadow))

@@ -17,6 +17,7 @@ import (
 	"undolayer/internal/policy"
 	"undolayer/internal/review"
 	"undolayer/internal/store"
+	"undolayer/internal/vault"
 )
 
 // DefaultOrder: data stores first, code next, infrastructure last.
@@ -48,12 +49,22 @@ type Manager struct {
 	// Notify, if set, is called for each request that waits for a reviewer (an action or a
 	// commit), with secrets already redacted.
 	Notify func(PendingAction)
+	// Vault, when set, keeps each change's before state on a quorum of replicas, written
+	// before the change runs; a change whose before state cannot be stored does not run.
+	Vault *vault.Vault
 
 	mu          sync.Mutex
 	connectors  map[string]Connector
 	regOrder    []string
 	approvalKey []byte
 	txs         map[string]*Tx
+	shapes      *shapeBook
+	later       sync.WaitGroup       // background vault writes
+	stamps      map[string][2]string // tx -> journal stamp and state, as last read
+	frozenMu    sync.Mutex
+	frozenCache map[string]Frozen
+	frozenErr   error
+	frozenAt    time.Time
 }
 
 func NewManager(stateDir string, pol *policy.Policy) (*Manager, error) {
@@ -92,6 +103,22 @@ func NewManagerWithStore(st store.Store, stateDir string, pol *policy.Policy) (*
 
 func (m *Manager) audit(event string, data map[string]any) {
 	_ = m.Audit.Record(event, normalizeMap(data))
+}
+
+// note audits an event that changes nothing (a read) without waiting for the disk; the
+// next durable event, or Flush, makes it durable too.
+func (m *Manager) note(event string, data map[string]any) {
+	m.Audit.Note(event, normalizeMap(data))
+}
+
+// Flush waits for background vault writes and makes every audit event so far durable
+// (call before the process exits).
+func (m *Manager) Flush() error {
+	m.later.Wait()
+	if m.Vault != nil {
+		_ = m.Vault.Flush()
+	}
+	return m.Audit.Flush()
 }
 
 func normalizeMap(d map[string]any) map[string]any {
@@ -185,8 +212,11 @@ func (m *Manager) Begin(task string) *Tx {
 	m.mu.Lock()
 	m.txs[t.ID] = t
 	m.mu.Unlock()
-	m.audit("begin", map[string]any{"tx": t.ID, "task": task})
-	m.Journal(t)
+	m.note("begin", map[string]any{"tx": t.ID, "task": task})
+	// nothing has happened yet: the journal is written within a second, or before anything
+	// can escape (an effect, a hold for approval, a commit), whichever comes first
+	t.journaled = time.Now()
+	t.journalSoon()
 	return t
 }
 
@@ -229,7 +259,37 @@ func (m *Manager) List() []Summary {
 	return out
 }
 
+// journalState: a transaction's state as the store holds it. With a store that can stamp
+// versions (files), the journal is read again only when it changed since the last read.
 func (m *Manager) journalState(id string) string {
+	if st, ok := m.Store.(interface{ Stamp(string) (string, error) }); ok {
+		stamp, err := st.Stamp(id)
+		if err != nil {
+			return ""
+		}
+		m.mu.Lock()
+		c, hit := m.stamps[id]
+		m.mu.Unlock()
+		if hit && c[0] == stamp {
+			return c[1]
+		}
+		b, err := m.Store.LoadTx(id)
+		if err != nil {
+			return ""
+		}
+		var d struct{ State string }
+		_ = json.Unmarshal(b, &d)
+		m.mu.Lock()
+		if m.stamps == nil {
+			m.stamps = map[string][2]string{}
+		}
+		if len(m.stamps) > 10000 {
+			m.stamps = map[string][2]string{}
+		}
+		m.stamps[id] = [2]string{stamp, d.State}
+		m.mu.Unlock()
+		return d.State
+	}
 	b, err := m.Store.LoadTx(id)
 	if err != nil {
 		return ""
@@ -241,15 +301,20 @@ func (m *Manager) journalState(id string) string {
 
 // Journal writes the transaction's state durably (write-ahead: before effects run).
 func (m *Manager) Journal(t *Tx) {
+	if err := m.journal(t); err != nil {
+		fmt.Fprintln(os.Stderr, "undolayer: journal:", err)
+	}
+}
+
+// journal is Journal that reports failure: used where going on without a durable journal
+// would break write-ahead (right before a connector applies its change).
+func (m *Manager) journal(t *Tx) error {
 	t.journaled, t.journalDirty = time.Now(), false
 	b, err := json.Marshal(t)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "undolayer: journal:", err)
-		return
+		return err
 	}
-	if err := m.Store.SaveTx(t.ID, b); err != nil {
-		fmt.Fprintln(os.Stderr, "undolayer: journal:", err)
-	}
+	return m.Store.SaveTx(t.ID, b)
 }
 
 // ---------------------------------------------------------------- approvals

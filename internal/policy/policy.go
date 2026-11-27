@@ -19,6 +19,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"undolayer/internal/model"
+	"undolayer/internal/risk"
 )
 
 //go:embed default_policy.toml
@@ -63,6 +64,9 @@ type Policy struct {
 	Rules    []Rule
 	Budget   map[string]float64
 	Settings Settings
+	// Risk, when set, scores every action; the score is the fact risk_score (0 to 1) and
+	// the features behind it are risk_signals. Rules decide what a score means.
+	Risk *risk.Model
 }
 
 func strs(v any) []string {
@@ -166,7 +170,10 @@ func Empty() *Policy { p, _ := FromMap(map[string]any{}); return p }
 
 // Extend combines two policies; the result is at least as strict as either.
 func (p *Policy) Extend(o *Policy) *Policy {
-	out := &Policy{Rules: append(append([]Rule{}, p.Rules...), o.Rules...), Budget: map[string]float64{}, Settings: p.Settings}
+	out := &Policy{Rules: append(append([]Rule{}, p.Rules...), o.Rules...), Budget: map[string]float64{}, Settings: p.Settings, Risk: p.Risk}
+	if o.Risk != nil {
+		out.Risk = o.Risk
+	}
 	for k, v := range p.Budget {
 		out.Budget[k] = v
 	}
@@ -377,6 +384,18 @@ func operator(v any, present bool, op string, arg any) bool {
 
 // Evaluate sets the action's decision and reasons.
 func (p *Policy) Evaluate(a *model.Action) {
+	if p.Risk != nil {
+		if a.Facts == nil {
+			a.Facts = model.Facts{}
+		}
+		score, signals := p.Risk.Score(a)
+		a.Facts["risk_score"] = score
+		names := []string{}
+		for _, s := range signals {
+			names = append(names, s.Feature)
+		}
+		a.Facts["risk_signals"] = names
+	}
 	d := defaultByEffect[a.Effect]
 	if d == model.Hold && !p.Settings.HoldIrreversible {
 		d = model.RequireApproval

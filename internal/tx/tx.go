@@ -24,10 +24,12 @@ import (
 	"sync"
 	"time"
 
+	"undolayer/internal/acmatch"
 	"undolayer/internal/model"
 	"undolayer/internal/scanner"
 	"undolayer/internal/store"
 	"undolayer/internal/taint"
+	"undolayer/internal/vault"
 )
 
 type OutboxItem struct {
@@ -76,8 +78,11 @@ type Tx struct {
 	Outbox        []*OutboxItem
 	Compensations []*CompRecord
 	UndoRecords   []*UndoRecord
-	Steps         []*Step
-	Handles       map[string]any
+	// AppliedUndo keeps every undo record after it was applied: the before-state of an
+	// undone change stays on record (see EvidenceReport).
+	AppliedUndo []*UndoRecord
+	Steps       []*Step
+	Handles     map[string]any
 	// AwaitingCommit is set while Commit waits for a reviewer's decision on the whole preview.
 	AwaitingCommit *CommitRequest
 	// Requester is who asked for the task.
@@ -101,6 +106,10 @@ type Tx struct {
 	fromSQL    map[string]bool // values that came out of database query results
 	fromWS     map[string]bool // lines that came out of the workspace (file reads, command output)
 	readTokens map[string]bool // addresses (URLs, e-mails, domains) seen in data the agent read
+
+	ownerChecked time.Time // when ownership was last confirmed against the state store
+	lineageAC    *acmatch.Matcher
+	lineageIDs   []string // matcher pattern id -> the action whose result held it
 }
 
 // ---------------------------------------------------------------- connector state
@@ -166,7 +175,19 @@ func (t *Tx) requireOwner() error {
 	if disk := t.Mgr.journalState(t.ID); disk != "" && disk != string(t.State) {
 		return &model.NotOwner{Msg: fmt.Sprintf("transaction %s is %s in the state store (recovered or changed by another process)", t.ID, disk)}
 	}
+	t.ownerChecked = time.Now()
 	return nil
+}
+
+// requireOwnerToRead: a read changes nothing, so the state store is consulted at most
+// every 250ms for reads; anything that can change something checks every time.
+func (t *Tx) requireOwnerToRead() error {
+	if t.owner != nil && time.Since(t.ownerChecked) < 250*time.Millisecond {
+		if h, ok := t.owner.(interface{ Held() bool }); !ok || h.Held() {
+			return nil
+		}
+	}
+	return t.requireOwner()
 }
 
 // Release drops ownership (what the kernel or the database does when the process dies).
@@ -242,6 +263,10 @@ func (t *Tx) learnLineage(actionID string, result any) {
 			if len(x) >= min {
 				if _, ok := t.lineage[x]; !ok {
 					t.lineage[x] = actionID
+					if t.lineageAC != nil {
+						t.lineageAC.Add(x)
+						t.lineageIDs = append(t.lineageIDs, actionID)
+					}
 				}
 			}
 		}
@@ -255,12 +280,15 @@ func (t *Tx) dependencies(args map[string]any) []string {
 	}
 	b, _ := json.Marshal(args)
 	blob := string(b)
-	set := map[string]bool{}
-	for v, id := range t.lineage {
-		if strings.Contains(blob, v) {
-			set[id] = true
+	if t.lineageAC == nil || t.lineageAC.Len() != len(t.lineage) { // built from what is known so far
+		t.lineageAC, t.lineageIDs = &acmatch.Matcher{}, nil
+		for v, id := range t.lineage {
+			t.lineageAC.Add(v)
+			t.lineageIDs = append(t.lineageIDs, id)
 		}
 	}
+	set := map[string]bool{}
+	t.lineageAC.Find(blob, func(i int) { set[t.lineageIDs[i]] = true }) // every earlier value in one pass
 	out := []string{}
 	for id := range set {
 		out = append(out, id)
@@ -291,8 +319,12 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	if t.State != model.Open {
 		return nil, fmt.Errorf("transaction %s is %s", t.ID, t.State)
 	}
-	if err := t.requireOwner(); err != nil {
+	if err := t.requireOwnerToRead(); err != nil { // anything that can change something checks again below
 		return nil, err
+	}
+	if why := t.frozen(); why != "" {
+		return nil, &model.PolicyViolation{Action: &model.Action{Connector: connector, Operation: op, Decision: model.Deny,
+			Reasons: []string{why}}}
 	}
 	c, err := t.Mgr.Connector(connector)
 	if err != nil {
@@ -307,6 +339,9 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	}
 	if facts == nil {
 		facts = model.Facts{}
+	}
+	if shape := shapeOf(facts); shape != "" {
+		facts["shape_new"] = !t.Mgr.shapeBook().Known(t.Requester, connector, shape)
 	}
 	blobB, _ := json.Marshal(args)
 	blob := string(blobB)
@@ -414,14 +449,44 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	if cc, ok := c.(Contained); ok {
 		contained = cc.Contained(op)
 	}
+	callBatch := ""
 	if effect != model.Read {
+		if err := t.requireOwner(); err != nil {
+			return nil, err
+		}
+		if why := t.frozen(true); why != "" {
+			return nil, &model.PolicyViolation{Action: &model.Action{Connector: connector, Operation: op, Decision: model.Deny,
+				Reasons: []string{why}}}
+		}
 		step = &Step{ActionID: a.ID, Connector: connector, Status: "about_to_run", Key: t.ID + "-" + a.ID, TS: model.Now()}
 		t.Steps = append(t.Steps, step)
 		if !contained {
 			t.Mgr.Journal(t) // intent first: this step can reach the world
+			// and the vault: the request is kept before it is sent
+			var verr error
+			if callBatch, verr = t.vaultCallIntent(a); verr != nil {
+				step.Status, a.Error = "not_run", verr.Error()
+				t.Mgr.Journal(t)
+				return nil, verr
+			}
 		}
 	}
 	res, err := c.Stage(t, a)
+	if callBatch != "" {
+		if err != nil { // not sent (a deferred one is stored again when it goes out on commit)
+			t.vaultCallDone(a, callBatch, "failed", nil, nil)
+		} else {
+			var comp json.RawMessage
+			out := res
+			if s, ok := res.(*Staged); ok {
+				out = s.Result
+				if s.Comp != nil {
+					comp, _ = json.Marshal(s.Comp.Record)
+				}
+			}
+			t.vaultCallDone(a, callBatch, "committed", out, comp)
+		}
+	}
 	if err != nil {
 		var d *model.Defer
 		var pv *model.PolicyViolation
@@ -522,7 +587,11 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 		walk(normalize(res))
 	}
 	a.Result = t.redact(res)
-	t.Mgr.audit("stage", map[string]any{"tx": t.ID, "action": a})
+	if effect == model.Read {
+		t.Mgr.note("stage", map[string]any{"tx": t.ID, "action": a})
+	} else {
+		t.Mgr.audit("stage", map[string]any{"tx": t.ID, "action": a})
+	}
 	if contained {
 		t.journalSoon()
 	} else {
@@ -779,6 +848,7 @@ func (t *Tx) Approve(approver, token string) error {
 		return err
 	}
 	t.Mgr.audit("approve", map[string]any{"tx": t.ID, "approver": approver, "preview_hash": h})
+	t.Mgr.recordEvidence(t, "commit", h, "approve", approver, t.Preview())
 	return nil
 }
 
@@ -820,9 +890,15 @@ func (t *Tx) Commit() (*CommitResult, error) {
 	if err := t.requireOwner(); err != nil {
 		return nil, err
 	}
-	t.flushJournal() // what reviewers see is exactly what is about to be judged
+	if why := t.frozen(true); why != "" {
+		return nil, &model.PolicyViolation{Action: &model.Action{Connector: "undolayer", Operation: "commit", Decision: model.Deny,
+			Reasons: []string{why}}}
+	}
 	pv := t.preview()
 	hash := pv["preview_hash"].(string)
+	if pv["approval_required"] == true {
+		t.flushJournal() // what reviewers see is exactly what is about to be judged
+	}
 	if pv["approval_required"] == true && !t.approved(hash) {
 		var reasons []string
 		switch rs := pv["approval_reasons"].(type) {
@@ -857,13 +933,21 @@ func (t *Tx) Commit() (*CommitResult, error) {
 			return nil, err
 		}
 	}
+	// Prepared and Committing are not written on their own: the journal write right
+	// before each connector applies (below) carries Committing and that connector's intent,
+	// and until it is on disk nothing has been applied, so recovery of the state on disk
+	// (Open) rolls back correctly.
 	t.State = model.Prepared
-	t.Mgr.Journal(t)
 	t.State = model.Committing
-	t.Mgr.Journal(t)
 	applied := []string{}
+	// intents stored in the vault for connectors that have not applied yet: settled as
+	// failed if the commit fails before they are applied
+	pendingVault := map[string]string{}
 	fail := func(err error) (*CommitResult, error) {
 		t.Mgr.audit("commit_failed", map[string]any{"tx": t.ID, "error": err.Error(), "applied": applied})
+		for name, batch := range pendingVault {
+			t.vaultSettle(name, "failed", batch, nil, nil)
+		}
 		errs := t.undoApplied()
 		for _, n := range order {
 			if !contains(applied, n) {
@@ -890,7 +974,7 @@ func (t *Tx) Commit() (*CommitResult, error) {
 		}
 		return nil, errors.New(msg)
 	}
-	for _, name := range order {
+	for ci, name := range order {
 		c, _ := t.Mgr.Connector(name)
 		var intent *UndoRecord
 		if ic, ok := c.(Intender); ok { // write-ahead: the way back is durable before anything changes
@@ -906,12 +990,52 @@ func (t *Tx) Commit() (*CommitResult, error) {
 		} else {
 			t.CommittingConnector = name // a crash now leaves this connector's state unknown
 		}
-		t.Mgr.Journal(t)
+		// the before state goes to the vault first: no quorum, no change
+		// the before state goes to the vault and the intent to the journal, both before
+		// the change: no quorum, no journal, no change. Neither has to precede the other,
+		// so they are written at the same time.
+		vaultBatch := ""
+		var vaulted json.RawMessage // the intent exactly as the vault holds it
+		var ventry *vault.Entry
+		if intent != nil && t.Mgr.Vault != nil {
+			e, err := t.vaultEntry(name, "intent", "", intent.Record)
+			if err != nil {
+				return fail(fmt.Errorf("%s: %v; nothing was changed", name, err))
+			}
+			ventry = &e
+		}
+		jb, jerr := json.Marshal(t)
+		var rc *vault.Receipt
+		var verr error
+		var vw sync.WaitGroup
+		if ventry != nil {
+			vw.Add(1)
+			go func() { defer vw.Done(); rc, verr = t.vaultAppend(*ventry) }()
+		}
+		if jerr == nil {
+			jerr = t.Mgr.Store.SaveTx(t.ID, jb)
+			t.journaled, t.journalDirty = time.Now(), false
+		}
+		vw.Wait()
+		if verr != nil {
+			if jerr == nil { // the intent is on disk: record that nothing was applied
+				t.UndoRecords = t.UndoRecords[:len(t.UndoRecords)-boolInt(intent != nil)]
+			}
+			return fail(fmt.Errorf("%s: the vault could not store the before state, so the change was not made: %v", name, verr))
+		}
+		if ventry != nil {
+			vaultBatch, vaulted = rc.Batch, intent.Record
+			pendingVault[name] = vaultBatch
+		}
+		if jerr != nil {
+			return fail(fmt.Errorf("%s: the journal could not be written, so the change was not made: %v", name, jerr))
+		}
 		rec, err := c.Commit(t)
 		t.CommittingConnector = ""
 		if err != nil {
 			return fail(err)
 		}
+		delete(pendingVault, name)
 		applied = append(applied, name)
 		switch {
 		case rec != nil && intent != nil: // the precise record replaces the intent
@@ -923,13 +1047,43 @@ func (t *Tx) Commit() (*CommitResult, error) {
 		case intent != nil: // nothing to undo after all
 			t.UndoRecords = t.UndoRecords[:len(t.UndoRecords)-1]
 		}
-		t.Mgr.Journal(t)
+		switch {
+		case vaultBatch != "":
+			var final json.RawMessage
+			if rec != nil {
+				final, _ = json.Marshal(rec)
+			}
+			t.vaultSettle(name, "committed", vaultBatch, vaulted, final)
+		case rec != nil && t.Mgr.Vault != nil:
+			// no write-ahead record from this connector: its record exists only now
+			raw, _ := json.Marshal(rec)
+			if e, err := t.vaultEntry(name, "committed", "", raw); err == nil {
+				if _, err := t.vaultAppend(e); err != nil {
+					fmt.Fprintf(os.Stderr, "undolayer: vault: %s %s: %v\n", t.ID, name, err)
+				}
+			}
+		}
+		if ci < len(order)-1 { // the precise record is durable before the next connector applies
+			t.Mgr.Journal(t)
+		}
 	}
 	t.State = model.Committed
+	// the outcome goes to the journal and the audit chain at the same time
+	var aw sync.WaitGroup
+	aw.Add(1)
+	go func() {
+		defer aw.Done()
+		t.Mgr.audit("commit", map[string]any{"tx": t.ID, "preview_hash": hash, "undo_records": len(t.UndoRecords)})
+	}()
 	t.Mgr.Journal(t)
-	t.Mgr.audit("commit", map[string]any{"tx": t.ID, "preview_hash": hash, "undo_records": len(t.UndoRecords)})
+	aw.Wait()
+	t.learnShapes()
 	rep := t.flushOutbox(0)
-	t.finish()
+	if len(t.Outbox) > 0 {
+		t.finish() // the outbox changed after the journal above
+	} else if t.State.Terminal() {
+		t.Release() // the journal above is the final state
+	}
 	return &CommitResult{Tx: t.ID, State: t.State, Applied: applied, Outbox: rep}, nil
 }
 
@@ -979,6 +1133,15 @@ func (t *Tx) flushOutbox(now float64) []OutboxReport {
 			a.Facts[k] = v
 		}
 		a.Facts["idempotency_key"] = item.Key
+		var callBatch string
+		if err == nil {
+			if callBatch, err = t.vaultCallIntent(&a); err != nil { // not sent: tried again at the next flush
+				item.Status, item.Error = "failed", err.Error()
+				rep = append(rep, OutboxReport{ActionID: a.ID, Status: item.Status, Error: item.Error})
+				t.Mgr.Journal(t)
+				continue
+			}
+		}
 		for i := 0; i < 3 && err == nil; i++ {
 			item.Attempts++
 			var res any
@@ -994,6 +1157,11 @@ func (t *Tx) flushOutbox(now float64) []OutboxReport {
 				}
 				item.Result, item.Status, item.Error = normalize(res), "sent", ""
 				t.Mgr.audit("effect_sent", map[string]any{"tx": t.ID, "action_id": a.ID, "idempotency_key": item.Key})
+				var comp json.RawMessage
+				if n := len(t.Compensations); n > 0 && t.Compensations[n-1].ActionID == a.ID {
+					comp = t.Compensations[n-1].Record
+				}
+				t.vaultCallDone(&a, callBatch, "committed", item.Result, comp)
 				break
 			}
 			item.Status, item.Error = "failed", err.Error()
@@ -1005,6 +1173,9 @@ func (t *Tx) flushOutbox(now float64) []OutboxReport {
 		}
 		if err != nil && item.Status != "failed" {
 			item.Status, item.Error = "failed", err.Error()
+		}
+		if item.Status != "sent" {
+			t.vaultCallDone(&a, callBatch, "failed", nil, nil)
 		}
 		r := OutboxReport{ActionID: a.ID, Status: item.Status}
 		if item.Status != "sent" {
@@ -1099,6 +1270,9 @@ func (t *Tx) undoApplied() []string {
 			} else {
 				err = c.Undo(r.Record)
 			}
+		}
+		if err == nil {
+			t.AppliedUndo = append(t.AppliedUndo, r)
 		}
 		if err != nil {
 			errs = append(errs, err.Error())
@@ -1200,6 +1374,7 @@ func (t *Tx) Undo(step string) (*UndoReport, error) {
 			switch {
 			case err == nil:
 				rep.Undone = append(rep.Undone, r.Connector)
+				t.AppliedUndo = append(t.AppliedUndo, r)
 			case errors.As(err, &cc):
 				rep.Conflicts = append(rep.Conflicts, map[string]any{"connector": r.Connector, "reason": err.Error()})
 				remaining = append([]*UndoRecord{r}, remaining...)
@@ -1346,6 +1521,7 @@ type journalForm struct {
 	Outbox        []*OutboxItem              `json:"outbox"`
 	Compensations []*CompRecord              `json:"compensations"`
 	UndoRecords   []*UndoRecord              `json:"undo_records"`
+	AppliedUndo   []*UndoRecord              `json:"applied_undo_records,omitempty"`
 	Steps         []*Step                    `json:"steps"`
 	State2        map[string]json.RawMessage `json:"connector_state"`
 	OwnerPID      int                        `json:"owner_pid,omitempty"`
@@ -1370,7 +1546,7 @@ func (t *Tx) MarshalJSON() ([]byte, error) {
 		st[k] = b
 	}
 	f := journalForm{ID: t.ID, Task: t.Task, State: t.State, Created: t.Created, Actions: t.Actions, Outbox: t.Outbox,
-		Compensations: t.Compensations, UndoRecords: t.UndoRecords, Steps: t.Steps, State2: st, Awaiting: t.AwaitingCommit, Requester: t.Requester,
+		Compensations: t.Compensations, UndoRecords: t.UndoRecords, AppliedUndo: t.AppliedUndo, Steps: t.Steps, State2: st, Awaiting: t.AwaitingCommit, Requester: t.Requester,
 		Committing: t.CommittingConnector}
 	if t.owner != nil {
 		f.OwnerPID, f.Node = os.Getpid(), t.Mgr.Node
@@ -1389,7 +1565,7 @@ func fromJournal(m *Manager, b []byte) (*Tx, error) {
 	}
 	t := newTx(m, f.Task, f.ID)
 	t.State, t.Created, t.Actions, t.Outbox = f.State, f.Created, f.Actions, f.Outbox
-	t.Compensations, t.UndoRecords, t.Steps = f.Compensations, f.UndoRecords, f.Steps
+	t.Compensations, t.UndoRecords, t.AppliedUndo, t.Steps = f.Compensations, f.UndoRecords, f.AppliedUndo, f.Steps
 	t.AwaitingCommit, t.Requester, t.Node, t.CommittingConnector = f.Awaiting, f.Requester, f.Node, f.Committing
 	if f.State2 != nil {
 		t.raw = f.State2
@@ -1404,4 +1580,11 @@ func newTx(m *Manager, task, id string) *Tx {
 	return &Tx{Mgr: m, ID: id, Task: task, State: model.Open, Created: model.Now(), Handles: map[string]any{},
 		conn: map[string]any{}, raw: map[string]json.RawMessage{}, lineage: map[string]string{},
 		fromSQL: map[string]bool{}, fromWS: map[string]bool{}, readTokens: map[string]bool{}}
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

@@ -38,6 +38,7 @@ func world(t *testing.T) *bench.World {
 	t.Helper()
 	w := bench.NewWorld(policy.Default(), true)
 	t.Cleanup(w.Close)
+	withVault(t, w, w.Mgr) // every scenario runs with the vault on: each change's before state is stored first
 	return w
 }
 
