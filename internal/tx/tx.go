@@ -297,6 +297,10 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	if err := t.requireOwner(); err != nil {
 		return nil, err
 	}
+	if why := t.frozen(); why != "" {
+		return nil, &model.PolicyViolation{Action: &model.Action{Connector: connector, Operation: op, Decision: model.Deny,
+			Reasons: []string{why}}}
+	}
 	c, err := t.Mgr.Connector(connector)
 	if err != nil {
 		return nil, err
@@ -311,7 +315,7 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	if facts == nil {
 		facts = model.Facts{}
 	}
-	if shape, _ := facts["query_shape"].(string); shape != "" {
+	if shape := shapeOf(facts); shape != "" {
 		facts["shape_new"] = !t.Mgr.shapeBook().Known(t.Requester, connector, shape)
 	}
 	blobB, _ := json.Marshal(args)
@@ -420,14 +424,37 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	if cc, ok := c.(Contained); ok {
 		contained = cc.Contained(op)
 	}
+	callBatch := ""
 	if effect != model.Read {
 		step = &Step{ActionID: a.ID, Connector: connector, Status: "about_to_run", Key: t.ID + "-" + a.ID, TS: model.Now()}
 		t.Steps = append(t.Steps, step)
 		if !contained {
 			t.Mgr.Journal(t) // intent first: this step can reach the world
+			// and the vault: the request is kept before it is sent
+			var verr error
+			if callBatch, verr = t.vaultCallIntent(a); verr != nil {
+				step.Status, a.Error = "not_run", verr.Error()
+				t.Mgr.Journal(t)
+				return nil, verr
+			}
 		}
 	}
 	res, err := c.Stage(t, a)
+	if callBatch != "" {
+		if err != nil { // not sent (a deferred one is stored again when it goes out on commit)
+			t.vaultCallDone(a, callBatch, "failed", nil, nil)
+		} else {
+			var comp json.RawMessage
+			out := res
+			if s, ok := res.(*Staged); ok {
+				out = s.Result
+				if s.Comp != nil {
+					comp, _ = json.Marshal(s.Comp.Record)
+				}
+			}
+			t.vaultCallDone(a, callBatch, "committed", out, comp)
+		}
+	}
 	if err != nil {
 		var d *model.Defer
 		var pv *model.PolicyViolation
@@ -827,6 +854,10 @@ func (t *Tx) Commit() (*CommitResult, error) {
 	if err := t.requireOwner(); err != nil {
 		return nil, err
 	}
+	if why := t.frozen(); why != "" {
+		return nil, &model.PolicyViolation{Action: &model.Action{Connector: "undolayer", Operation: "commit", Decision: model.Deny,
+			Reasons: []string{why}}}
+	}
 	t.flushJournal() // what reviewers see is exactly what is about to be judged
 	pv := t.preview()
 	hash := pv["preview_hash"].(string)
@@ -1027,6 +1058,15 @@ func (t *Tx) flushOutbox(now float64) []OutboxReport {
 			a.Facts[k] = v
 		}
 		a.Facts["idempotency_key"] = item.Key
+		var callBatch string
+		if err == nil {
+			if callBatch, err = t.vaultCallIntent(&a); err != nil { // not sent: tried again at the next flush
+				item.Status, item.Error = "failed", err.Error()
+				rep = append(rep, OutboxReport{ActionID: a.ID, Status: item.Status, Error: item.Error})
+				t.Mgr.Journal(t)
+				continue
+			}
+		}
 		for i := 0; i < 3 && err == nil; i++ {
 			item.Attempts++
 			var res any
@@ -1042,6 +1082,11 @@ func (t *Tx) flushOutbox(now float64) []OutboxReport {
 				}
 				item.Result, item.Status, item.Error = normalize(res), "sent", ""
 				t.Mgr.audit("effect_sent", map[string]any{"tx": t.ID, "action_id": a.ID, "idempotency_key": item.Key})
+				var comp json.RawMessage
+				if n := len(t.Compensations); n > 0 && t.Compensations[n-1].ActionID == a.ID {
+					comp = t.Compensations[n-1].Record
+				}
+				t.vaultCallDone(&a, callBatch, "committed", item.Result, comp)
 				break
 			}
 			item.Status, item.Error = "failed", err.Error()
@@ -1053,6 +1098,9 @@ func (t *Tx) flushOutbox(now float64) []OutboxReport {
 		}
 		if err != nil && item.Status != "failed" {
 			item.Status, item.Error = "failed", err.Error()
+		}
+		if item.Status != "sent" {
+			t.vaultCallDone(&a, callBatch, "failed", nil, nil)
 		}
 		r := OutboxReport{ActionID: a.ID, Status: item.Status}
 		if item.Status != "sent" {

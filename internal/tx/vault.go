@@ -129,6 +129,32 @@ func (m *Manager) ChangedRows(id string) ([]ChangedRows, error) {
 				return nil, err
 			}
 		}
+		// calls that reached the outside: what was sent, what came back, how to compensate
+		byID := map[string]*model.Action{}
+		for _, a := range t.Actions {
+			byID[a.ID] = a
+		}
+		comped := map[string]bool{}
+		for _, c := range t.Compensations {
+			if a := byID[c.ActionID]; a != nil {
+				comped[a.ID] = true
+				res := a.Result
+				for _, o := range t.Outbox {
+					if o.Action.ID == a.ID && o.Result != nil {
+						res = o.Result
+					}
+				}
+				out = append(out, ChangedRows{Tx: id, Connector: c.Connector, State: t.State, Source: "journal", Undone: c.Done,
+					Rows: []vault.Row{callRow(a, res)}, Record: c.Record})
+			}
+		}
+		for _, o := range t.Outbox {
+			if o.Status == "sent" && !comped[o.Action.ID] {
+				a := o.Action
+				out = append(out, ChangedRows{Tx: id, Connector: a.Connector, State: t.State, Source: "journal",
+					Rows: []vault.Row{callRow(&a, o.Result)}})
+			}
+		}
 		if len(out) > 0 || m.Vault == nil {
 			return out, nil
 		}
@@ -166,8 +192,13 @@ func (m *Manager) ChangedRows(id string) ([]ChangedRows, error) {
 		switch settled[b.Batch] {
 		case "committed":
 			for _, c := range bs {
-				if c.Ref == b.Batch && c.Phase == "committed" && c.Complete && len(c.Undo) > 0 && c.Error == "" {
-					cr.Rows, cr.Record = c.Rows, c.Undo
+				if c.Ref == b.Batch && c.Phase == "committed" && c.Complete && c.Error == "" {
+					if len(c.Rows) > 0 {
+						cr.Rows = c.Rows
+					}
+					if len(c.Undo) > 0 {
+						cr.Record = c.Undo
+					}
 				}
 			}
 		}
@@ -180,4 +211,49 @@ func (m *Manager) ChangedRows(id string) ([]ChangedRows, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// Calls that reach the outside world at once (an API write in the compensable lane, a
+// message, a webhook, a tool on another MCP server) have no staged before state to keep:
+// what the vault keeps is the call itself. The request is stored before it is sent (no
+// quorum, no call), and the response and the recipe that compensates it after.
+
+func callRow(a *model.Action, result any) vault.Row {
+	r := vault.Row{Table: a.Connector + "." + a.Operation, Op: "call", Key: map[string]any{"action_id": a.ID},
+		Before: map[string]any{"request": normalize(a.Args), "effect": string(a.Effect)}}
+	if k, ok := a.Facts["idempotency_key"].(string); ok && k != "" {
+		r.Key["idempotency_key"] = k
+	}
+	if result != nil {
+		r.After = map[string]any{"response": normalize(result)}
+	}
+	return r
+}
+
+// vaultCallIntent stores a call before it is made. An error means it must not be made.
+func (t *Tx) vaultCallIntent(a *model.Action) (string, error) {
+	if t.Mgr.Vault == nil {
+		return "", nil
+	}
+	rc, err := t.vaultAppend(vault.Entry{Tx: t.ID, Task: t.Task, Requester: t.Requester, Connector: a.Connector,
+		Phase: "intent", Rows: []vault.Row{callRow(a, nil)}})
+	if err != nil {
+		return "", fmt.Errorf("%s.%s: the vault could not store the request, so it was not sent: %v", a.Connector, a.Operation, err)
+	}
+	return rc.Batch, nil
+}
+
+// vaultCallDone records how a call ended: committed (with its response and compensation
+// recipe) or failed.
+func (t *Tx) vaultCallDone(a *model.Action, batch, phase string, result any, comp json.RawMessage) {
+	if t.Mgr.Vault == nil || batch == "" {
+		return
+	}
+	e := vault.Entry{Tx: t.ID, Task: t.Task, Requester: t.Requester, Connector: a.Connector, Phase: phase, Ref: batch, Undo: comp}
+	if phase == "committed" {
+		e.Rows = []vault.Row{callRow(a, result)}
+	}
+	if _, err := t.vaultAppend(e); err != nil {
+		fmt.Fprintf(os.Stderr, "undolayer: vault: recording the result of %s.%s in %s: %v\n", a.Connector, a.Operation, t.ID, err)
+	}
 }

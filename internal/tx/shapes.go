@@ -105,7 +105,7 @@ func (b *shapeBook) Learn(ls []shapeLine) error {
 func (t *Tx) learnShapes() {
 	var ls []shapeLine
 	for _, a := range t.Actions {
-		s, _ := a.Facts["query_shape"].(string)
+		s := shapeOf(a.Facts)
 		if s == "" || a.Decision == model.Deny || a.Error != "" || t.cancelled(a.ID) {
 			continue
 		}
@@ -114,4 +114,14 @@ func (t *Tx) learnShapes() {
 	if len(ls) > 0 {
 		_ = t.Mgr.shapeBook().Learn(ls)
 	}
+}
+
+// shapeOf: a SQL statement's shape (query_shape), or an HTTP request's or tool call's
+// (request_shape).
+func shapeOf(f model.Facts) string {
+	if s, _ := f["query_shape"].(string); s != "" {
+		return s
+	}
+	s, _ := f["request_shape"].(string)
+	return s
 }

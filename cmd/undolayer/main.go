@@ -13,6 +13,7 @@
 //	undolayer restore <tx> [--table T] [--key '{"id":42}'] [--on-conflict skip] [--dry-run] [--yes]
 //	undolayer revert --requester NAME [--since 2h] [--until TIME] [--dry-run] [--yes]
 //	undolayer vault check | repair | keys | rotate-key | shred-key <id>
+//	undolayer freeze <requester> [--reason TEXT] | unfreeze <requester> | frozen
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
 
@@ -173,6 +174,11 @@ func main() {
 	case "risk":
 		parseArgs(fs, args)
 		riskCmd(*cfgPath, fs.Args())
+		return
+	case "freeze", "unfreeze", "frozen":
+		parseArgs(fs, args)
+		_, m := load(*cfgPath)
+		freezeCmd(m, cmd, fs.Args())
 		return
 	case "changes", "restore", "revert", "vault":
 		parseArgs(fs, args)

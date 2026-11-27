@@ -571,3 +571,43 @@ func touches(cr tx.ChangedRows, names []any, table string) bool {
 	}
 	return false
 }
+
+// undolayer freeze <requester> [--reason TEXT] | unfreeze <requester> | frozen
+// Freezing stops a requester everywhere at once: every call on every connector, and every
+// commit, on every gateway sharing the state store.
+func freezeCmd(m *tx.Manager, cmd string, args []string) {
+	by := "operator"
+	if u, err := user.Current(); err == nil {
+		by = u.Username
+	}
+	switch cmd {
+	case "frozen":
+		l, err := m.FrozenRequesters()
+		if err != nil {
+			die(err)
+		}
+		out(l)
+	case "freeze":
+		if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+			die(errors.New("usage: undolayer freeze <requester> [--reason TEXT]"))
+		}
+		reason := "frozen by an operator"
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == "--reason" {
+				reason = args[i+1]
+			}
+		}
+		if err := m.Freeze(args[0], by, reason); err != nil {
+			die(err)
+		}
+		fmt.Printf("%s is frozen: nothing it asks for runs or commits until: undolayer unfreeze %s\n", args[0], args[0])
+	case "unfreeze":
+		if len(args) == 0 {
+			die(errors.New("usage: undolayer unfreeze <requester>"))
+		}
+		if err := m.Unfreeze(args[0], by); err != nil {
+			die(err)
+		}
+		fmt.Printf("%s can act again\n", args[0])
+	}
+}
