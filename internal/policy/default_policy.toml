@@ -238,6 +238,44 @@ when = { unknown_statement = true }
 decision = "require_approval"
 reason = "Statement type the runtime does not model"
 
+# ---------------------------------------------------------------- SQL injection
+# From the statement's structure (PostgreSQL's parse tree; SQLite's tokens) and from what
+# the database reports (functions called, catalog tables read), never from searching the
+# text for attack strings. Signals: or_tautology, trailing_comment, comment, union, stacked,
+# system_catalog, time_delay, file_or_program. Each SQL action also carries query_shape and
+# shape_new (its requester never committed a query of this shape). Signals that legitimate
+# queries also produce (union, comment, system_catalog) have no default rule; a gateway in
+# front of an application, whose queries repeat, can add one, e.g.
+#   when = { shape_new = true, sql_injection_signals = { in = ["union", "trailing_comment"] } }
+[[rule]]
+id = "sql-injection-or-tautology-read"
+connector = "sql"
+effect = ["read"]
+when = { sql_injection_signals = { in = ["or_tautology"] } }
+decision = "deny"
+reason = "An always-true OR condition (OR 1=1, OR 'a'='a', OR true) is how injected input widens a query to every row; a read would return the data at once, so it does not run"
+
+[[rule]]
+id = "sql-injection-or-tautology-write"
+connector = "sql"
+when = { sql_injection_signals = { in = ["or_tautology"] } }
+decision = "require_approval"
+reason = "An always-true OR condition (OR 1=1, OR 'a'='a', OR true) makes the statement touch every row; it is staged and measured, and a human must approve it"
+
+[[rule]]
+id = "sql-time-delay"
+connector = "sql"
+when = { sql_injection_signals = { in = ["time_delay"] } }
+decision = "deny"
+reason = "pg_sleep and its kin are how blind SQL injection reads data one timing at a time, and they hold connections and locks"
+
+[[rule]]
+id = "sql-file-or-program"
+connector = "sql"
+when = { sql_injection_signals = { in = ["file_or_program"] } }
+decision = "deny"
+reason = "The statement reads or writes server files, loads code or opens connections to other databases (pg_read_file, lo_export, dblink, load_extension, readfile)"
+
 [[rule]]
 id = "sql-schema-unsupported"
 connector = "sql"

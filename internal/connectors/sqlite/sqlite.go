@@ -74,8 +74,13 @@ func analyze(log []authEntry) model.Facts {
 	writes := map[string]map[string]bool{}
 	schema, control, altered := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	pragma := []string{}
+	funcs, catalogRead := map[string]bool{}, false
 	for _, e := range log {
 		switch {
+		case e.Name == "FUNCTION":
+			funcs[strings.ToLower(e.A2)] = true
+		case e.Name == "READ" && catalogTables[strings.ToLower(e.A1)]:
+			catalogRead = true
 		case e.Name == "INSERT" || e.Name == "UPDATE" || e.Name == "DELETE":
 			if catalogTables[e.A1] || e.DB == "temp" {
 				continue
@@ -121,6 +126,7 @@ func analyze(log []authEntry) model.Facts {
 	f := model.Facts{"writes": wf, "tables_written": sorted(tables), "schema_ops": sorted(schema),
 		"transaction_control": control["transaction"] || control["savepoint"], "attach": control["attach"] || control["detach"],
 		"pragma_set": pragma, "altered_tables": sorted(altered)}
+	f["functions"], f["reads_catalog"] = sorted(funcs), catalogRead
 	f["is_write"] = len(tables) > 0 || len(schema) > 0 || len(control) > 0 || len(pragma) > 0
 	f["destroys_schema"] = schema["drop_table"] || schema["drop_vtable"]
 	return f
