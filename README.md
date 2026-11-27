@@ -45,11 +45,13 @@ Countersign doesn't ask a model whether something is safe. Every decision comes 
 
 | | |
 |---|---|
-| **AWS** | Create and update cloud resources, undoable. Your IAM decides what counts as a change. Secrets never reach the agent. Terraform applied on commit. Deletes wait for a person. |
+| **AWS, Azure, Google Cloud** | Create and update cloud resources, undoable, with only what changed put back. Your cloud permissions decide what counts as a change. Secrets never reach the agent, and changes to secrets the cloud hides wait for a person. Anything opened to the whole internet waits for a person. Terraform applied on commit. Deletes wait for a person. |
 | **Kubernetes** | Your cluster validates every change first. Undo keeps the autoscaler's work. Whole namespaces come back. Data-destroying deletes need a person. |
 | **Databases** | PostgreSQL and SQLite. Changes are invisible until commit, with exact undo even after commit. Many agents at once, no overwrites. |
 | **Code and git** | A sandboxed shell on a private copy. Pushes you can take back. Keys and `.env` files never leave. |
-| **Any SaaS** | One small TOML file per app. Messages go out on commit. Payments and unrequested recipients wait for a reviewer. |
+| **Any SaaS and HTTP API** | One small TOML file per app. Messages go out on commit. Payments and unrequested recipients wait for a reviewer. Every call is in the vault before it is sent. Agents can't reach cloud metadata services or private networks. |
+| **Other MCP servers** | Their tools sit behind Countersign with the same policy, approval, vault and audit. Tool definitions are pinned, so a server can't quietly rewrite a tool. |
+| **AI agents** | One command freezes an agent everywhere at once. |
 
 ## Plug it in
 
@@ -232,6 +234,51 @@ Injection changes the shape of a query, not only its values. Countersign takes e
 - file, program or code access (`pg_read_file`, `COPY ... PROGRAM`, `dblink`, `load_extension`)
 
 By default, an injected read is refused before it runs; an injected write is staged, measured and sent to a human; time delays and file or program access are refused. Each statement also carries `query_shape`, plus `shape_new` when its caller has never committed a query of that shape (shapes are learned only from committed tasks). Postgres parses each distinct statement once and caches the result.
+
+### Put other MCP servers behind it
+
+```toml
+[[mcp_server]]
+name = "github"
+command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "..." }   # the agent never sees it
+trust_annotations = true                         # run tools marked readOnlyHint at once
+
+[mcp_server.tools.create_issue]
+lane = "compensable"
+undo = { tool = "update_issue", args = { owner = "$args.owner", repo = "$args.repo", issue_number = "$response.structured.number", state = "closed" } }
+```
+
+The server's tools appear as `github_<tool>`. A tool with no declared lane waits for a person and runs on commit; a server's own annotations are only hints. Each tool's definition is pinned the first time Countersign sees it. A tool whose description or schema changes later, or a new tool, is refused until you review it with `undolayer mcp pin github`. URL arguments are checked the same way as HTTP requests. Use `url = "https://..."` (with `headers`) for servers over HTTP.
+
+### Azure and Google Cloud
+
+```toml
+[azure]
+subscription = "00000000-0000-0000-0000-000000000000"   # tokens from `az account get-access-token`
+
+[gcp.types."compute.googleapis.com/Firewall"]           # tokens from `gcloud auth print-access-token`
+collection = "https://compute.googleapis.com/compute/v1/projects/my-project/global/firewalls"
+update = "mask"                                         # or "merge" or "put"
+```
+
+Resources work as they do on AWS: `azure_resource_update` and `gcp_resource_update` take a JSON Patch, and undo puts back only what the task changed.
+
+- A type becomes undoable after `undolayer azure verify <type> ...` (or `gcp verify`) runs a real create, update, undo and delete with it.
+- Azure updates send only what changed, guarded by the resource's etag, so secrets Azure never returns are left alone.
+- A create retried after a crash finds the resource it made, and never takes over someone else's.
+
+### HTTP requests and freezing an agent
+
+The agent's own `http.request` calls never reach cloud metadata services (`169.254.169.254`, `metadata.google.internal`, ...). They don't reach private networks either, unless you allow a host in `[http] allow_private_hosts`. This is checked again on the address actually connected to, so DNS rebinding and redirects don't get around it. Other URL schemes, credentials in URLs, and line breaks in headers are refused.
+
+```sh
+undolayer freeze billing-agent --reason "unexpected deletes"   # stops it everywhere
+undolayer frozen
+undolayer unfreeze billing-agent
+```
+
+A frozen agent can't run anything or commit anything, on any connector, on any gateway that shares the state store.
 
 ### Learn from your reviewers
 
