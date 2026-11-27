@@ -311,6 +311,9 @@ func (t *Tx) call(connector, op string, args map[string]any) (any, error) {
 	if facts == nil {
 		facts = model.Facts{}
 	}
+	if shape, _ := facts["query_shape"].(string); shape != "" {
+		facts["shape_new"] = !t.Mgr.shapeBook().Known(t.Requester, connector, shape)
+	}
 	blobB, _ := json.Marshal(args)
 	blob := string(blobB)
 	labels := t.Sensitive().LabelsIn(blob)
@@ -866,8 +869,14 @@ func (t *Tx) Commit() (*CommitResult, error) {
 	t.State = model.Committing
 	t.Mgr.Journal(t)
 	applied := []string{}
+	// intents stored in the vault for connectors that have not applied yet: settled as
+	// failed if the commit fails before they are applied
+	pendingVault := map[string]string{}
 	fail := func(err error) (*CommitResult, error) {
 		t.Mgr.audit("commit_failed", map[string]any{"tx": t.ID, "error": err.Error(), "applied": applied})
+		for name, batch := range pendingVault {
+			t.vaultSettle(name, "failed", batch, nil, nil)
+		}
 		errs := t.undoApplied()
 		for _, n := range order {
 			if !contains(applied, n) {
@@ -910,12 +919,30 @@ func (t *Tx) Commit() (*CommitResult, error) {
 		} else {
 			t.CommittingConnector = name // a crash now leaves this connector's state unknown
 		}
-		t.Mgr.Journal(t)
+		// the before state goes to the vault first: no quorum, no change
+		vaultBatch := ""
+		var vaulted json.RawMessage // the intent exactly as the vault holds it
+		if intent != nil && t.Mgr.Vault != nil {
+			e, err := t.vaultEntry(name, "intent", "", intent.Record)
+			if err != nil {
+				return fail(fmt.Errorf("%s: %v; nothing was changed", name, err))
+			}
+			rc, err := t.vaultAppend(e)
+			if err != nil {
+				return fail(fmt.Errorf("%s: the vault could not store the before state, so the change was not made: %v", name, err))
+			}
+			vaultBatch, vaulted = rc.Batch, intent.Record
+			pendingVault[name] = vaultBatch
+		}
+		if err := t.Mgr.journal(t); err != nil {
+			return fail(fmt.Errorf("%s: the journal could not be written, so the change was not made: %v", name, err))
+		}
 		rec, err := c.Commit(t)
 		t.CommittingConnector = ""
 		if err != nil {
 			return fail(err)
 		}
+		delete(pendingVault, name)
 		applied = append(applied, name)
 		switch {
 		case rec != nil && intent != nil: // the precise record replaces the intent
@@ -927,11 +954,28 @@ func (t *Tx) Commit() (*CommitResult, error) {
 		case intent != nil: // nothing to undo after all
 			t.UndoRecords = t.UndoRecords[:len(t.UndoRecords)-1]
 		}
+		switch {
+		case vaultBatch != "":
+			var final json.RawMessage
+			if rec != nil {
+				final, _ = json.Marshal(rec)
+			}
+			t.vaultSettle(name, "committed", vaultBatch, vaulted, final)
+		case rec != nil && t.Mgr.Vault != nil:
+			// no write-ahead record from this connector: its record exists only now
+			raw, _ := json.Marshal(rec)
+			if e, err := t.vaultEntry(name, "committed", "", raw); err == nil {
+				if _, err := t.vaultAppend(e); err != nil {
+					fmt.Fprintf(os.Stderr, "undolayer: vault: %s %s: %v\n", t.ID, name, err)
+				}
+			}
+		}
 		t.Mgr.Journal(t)
 	}
 	t.State = model.Committed
 	t.Mgr.Journal(t)
 	t.Mgr.audit("commit", map[string]any{"tx": t.ID, "preview_hash": hash, "undo_records": len(t.UndoRecords)})
+	t.learnShapes()
 	rep := t.flushOutbox(0)
 	t.finish()
 	return &CommitResult{Tx: t.ID, State: t.State, Applied: applied, Outbox: rep}, nil

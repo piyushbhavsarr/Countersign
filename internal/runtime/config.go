@@ -42,6 +42,7 @@ import (
 	"undolayer/internal/risk"
 	"undolayer/internal/store"
 	"undolayer/internal/tx"
+	"undolayer/internal/vault"
 )
 
 type Config struct {
@@ -126,6 +127,22 @@ type Config struct {
 	Risk struct {
 		Model string `toml:"model"`
 	} `toml:"risk"`
+	// Vault: where each change's before state is kept, written before the change runs.
+	// replicas are directories, ideally on independent disks or volumes; a change runs only
+	// once write_quorum of them (default: a majority) have its before state on disk.
+	// Default: one replica in state_dir/vault.
+	// Content is sealed with AES-256-GCM under keys in key_file (default state_dir/vault.keys),
+	// kept apart from the replicas: shredding a key makes what it sealed unreadable on every
+	// replica. encrypt = false stores it in the clear. require_independent_replicas refuses
+	// replicas on the same device.
+	Vault struct {
+		Replicas           []string `toml:"replicas"`
+		WriteQuorum        int      `toml:"write_quorum"`
+		Disabled           bool     `toml:"disabled"`
+		Encrypt            *bool    `toml:"encrypt"`
+		KeyFile            string   `toml:"key_file"`
+		RequireIndependent bool     `toml:"require_independent_replicas"`
+	} `toml:"vault"`
 	Reviewers map[string]map[string]any `toml:"reviewers"`
 	// [[approval_rule]] id, connector, operation, effect, when, roles, count, reason
 	ApprovalRules []map[string]any `toml:"approval_rule"`
@@ -212,6 +229,37 @@ func Build(c *Config) (*tx.Manager, *workspace.FS, error) {
 	}
 	if c.Node != "" {
 		m.Node = c.Node
+	}
+	if !c.Vault.Disabled {
+		reps := []string{}
+		for _, r := range c.Vault.Replicas {
+			reps = append(reps, c.Abs(r))
+		}
+		if len(reps) == 0 {
+			reps = []string{filepath.Join(c.StateDir, "vault")}
+		}
+		var keys *vault.Keyring
+		if c.Vault.Encrypt == nil || *c.Vault.Encrypt {
+			kf := filepath.Join(c.StateDir, "vault.keys")
+			if c.Vault.KeyFile != "" {
+				kf = c.Abs(c.Vault.KeyFile)
+			}
+			for _, r := range reps {
+				if rel, err := filepath.Rel(r, kf); err == nil && !strings.HasPrefix(rel, "..") {
+					return nil, nil, fmt.Errorf("[vault] key_file must not be inside a replica (%s): shredding a key would not reach copies of the replica", r)
+				}
+			}
+			var err error
+			if keys, err = vault.OpenKeyring(kf); err != nil {
+				return nil, nil, fmt.Errorf("[vault] key_file: %w", err)
+			}
+		}
+		v, err := vault.Open(vault.Options{Replicas: reps, WriteQuorum: c.Vault.WriteQuorum, Keys: keys,
+			RequireIndependent: c.Vault.RequireIndependent, LockPath: filepath.Join(c.StateDir, "vault.lock")})
+		if err != nil {
+			return nil, nil, fmt.Errorf("[vault]: %w", err)
+		}
+		m.Vault = v
 	}
 	if c.Approvals.Wait != "" {
 		d, err := time.ParseDuration(c.Approvals.Wait)

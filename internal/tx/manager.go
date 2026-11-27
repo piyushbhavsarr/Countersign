@@ -17,6 +17,7 @@ import (
 	"undolayer/internal/policy"
 	"undolayer/internal/review"
 	"undolayer/internal/store"
+	"undolayer/internal/vault"
 )
 
 // DefaultOrder: data stores first, code next, infrastructure last.
@@ -48,12 +49,16 @@ type Manager struct {
 	// Notify, if set, is called for each request that waits for a reviewer (an action or a
 	// commit), with secrets already redacted.
 	Notify func(PendingAction)
+	// Vault, when set, keeps each change's before state on a quorum of replicas, written
+	// before the change runs; a change whose before state cannot be stored does not run.
+	Vault *vault.Vault
 
 	mu          sync.Mutex
 	connectors  map[string]Connector
 	regOrder    []string
 	approvalKey []byte
 	txs         map[string]*Tx
+	shapes      *shapeBook
 }
 
 func NewManager(stateDir string, pol *policy.Policy) (*Manager, error) {
@@ -241,15 +246,20 @@ func (m *Manager) journalState(id string) string {
 
 // Journal writes the transaction's state durably (write-ahead: before effects run).
 func (m *Manager) Journal(t *Tx) {
+	if err := m.journal(t); err != nil {
+		fmt.Fprintln(os.Stderr, "undolayer: journal:", err)
+	}
+}
+
+// journal is Journal that reports failure: used where going on without a durable journal
+// would break write-ahead (right before a connector applies its change).
+func (m *Manager) journal(t *Tx) error {
 	t.journaled, t.journalDirty = time.Now(), false
 	b, err := json.Marshal(t)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "undolayer: journal:", err)
-		return
+		return err
 	}
-	if err := m.Store.SaveTx(t.ID, b); err != nil {
-		fmt.Fprintln(os.Stderr, "undolayer: journal:", err)
-	}
+	return m.Store.SaveTx(t.ID, b)
 }
 
 // ---------------------------------------------------------------- approvals
