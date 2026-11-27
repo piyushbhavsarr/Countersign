@@ -235,6 +235,32 @@ Injection changes the shape of a query, not only its values. Countersign takes e
 
 By default, an injected read is refused before it runs; an injected write is staged, measured and sent to a human; time delays and file or program access are refused. Each statement also carries `query_shape`, plus `shape_new` when its caller has never committed a query of that shape (shapes are learned only from committed tasks). Postgres parses each distinct statement once and caches the result.
 
+### Put it in front of PostgreSQL
+
+Applications and agents connect to Countersign as if it were the database. It speaks PostgreSQL's own protocol, including prepared statements, pipelining, COPY and cancel requests.
+
+```toml
+[[pg_gateway]]
+name = "main"
+listen = "127.0.0.1:6432"
+primary = "postgres://countersign:...@db-primary:5432/app"   # the gateway's own credentials
+replicas = ["postgres://countersign:...@db-replica:5432/app"]
+read_only_users = ["reports"]                               # these sessions read from a replica
+users = { app = "app-password" }                            # SCRAM-SHA-256; apps never hold the DB password
+mode = "enforce"                                            # or "watch": refuse nothing, audit what it would refuse
+```
+
+```sh
+undolayer pg install -c undolayer.toml    # once per database: row capture and the refusal function
+undolayer gateway -c undolayer.toml
+```
+
+- **Protect.** Each statement is checked from PostgreSQL's own parse tree: injection signs, query shape, and what it touches. The result is cached by statement text. Sessions go to the main database or to a replica that isn't lagging, and the gateway follows a failover. If two servers both claim to be the main database, writes are refused.
+- **Block.** A refused statement is answered by the database itself raising the error, so the client sees exactly what any failed statement produces, including an aborted transaction. A transaction is checked again at COMMIT on what it actually changed (rows, share of a table, tables without a primary key), and refused if it went too far.
+- **Undo.** Rows are captured as statements run. Before the COMMIT is passed on, every changed row's before state is stored in the vault on a majority of replicas. With no quorum there is no commit. `changes`, `restore`, `revert` and `undo` work on gateway transactions; their ids are in the audit chain as `gateway_commit` events.
+
+Reads pay a cached decision and a relay. Writes pay one extra round trip at COMMIT and a vault write, shared with every other commit in flight.
+
 ### Put other MCP servers behind it
 
 ```toml

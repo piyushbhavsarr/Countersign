@@ -137,7 +137,7 @@ func (c *Connector) sourceRecord(t *tx.Tx, src string) (*UndoRecord, error) {
 		if err := json.Unmarshal(cr.Record, &rec); err != nil {
 			return nil, fmt.Errorf("%s: unreadable undo record: %v", src, err)
 		}
-		if rec.DSN != c.DSN {
+		if !c.sameDB(rec.DSN) {
 			return nil, fmt.Errorf("%s changed another database (%s); restore it from a gateway connected to that one", src, redact(rec.DSN))
 		}
 		out.Changes = append(out.Changes, rec.Changes...)

@@ -7,14 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/signal"
 	"os/user"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"undolayer/internal/connectors/mcpproxy"
+	"undolayer/internal/gateway/pggw"
 	"undolayer/internal/model"
+	rt "undolayer/internal/runtime"
 	"undolayer/internal/tx"
 	"undolayer/internal/vault"
 )
@@ -655,3 +660,51 @@ func mcpCmd(m *tx.Manager, args []string) {
 }
 
 func printJSON(v any) { out(v) }
+
+// undolayer gateway: serve every [[pg_gateway]] until SIGINT or SIGTERM, then finish the
+// vault and audit writes in flight.
+func gatewayCmd(c *rt.Config, m *tx.Manager) {
+	if len(c.PGGateways) == 0 {
+		die(errors.New("no [[pg_gateway]] in the configuration"))
+	}
+	var gws []*pggw.Gateway
+	var ls []net.Listener
+	for _, r := range c.PGGateways {
+		g, err := pggw.New(r, m)
+		if err != nil {
+			die(err)
+		}
+		m.Register(g.Conn)
+		l, err := net.Listen("tcp", r.Listen)
+		if err != nil {
+			die(fmt.Errorf("[[pg_gateway]] %s: %v", r.Name, err))
+		}
+		fmt.Fprintf(os.Stderr, "countersign gateway %s: %s -> %s (%s)\n", r.Name, l.Addr(), redactDSN(r.Primary), g.R.Mode)
+		gws, ls = append(gws, g), append(ls, l)
+		go func(g *pggw.Gateway, l net.Listener) {
+			if err := g.Serve(l); err != nil {
+				fmt.Fprintln(os.Stderr, "gateway:", err)
+			}
+		}(g, l)
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	for i, g := range gws {
+		g.Close()
+		_ = ls[i].Close()
+	}
+	_ = m.Flush()
+}
+
+func redactDSN(dsn string) string {
+	if i := strings.Index(dsn, "://"); i >= 0 {
+		if j := strings.Index(dsn[i+3:], "@"); j >= 0 {
+			cred := dsn[i+3 : i+3+j]
+			if k := strings.Index(cred, ":"); k >= 0 {
+				return dsn[:i+3] + cred[:k] + ":***" + dsn[i+3+j:]
+			}
+		}
+	}
+	return dsn
+}

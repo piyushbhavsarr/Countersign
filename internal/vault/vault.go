@@ -191,10 +191,12 @@ type Vault struct {
 	o  Options
 	mu sync.Mutex
 	// group commit
-	qmu     sync.Mutex
-	queue   []*waiter
-	leading bool
-	shared  [][]string
+	qmu       sync.Mutex
+	queue     []*waiter
+	lazy      []*waiter
+	lazyTimer bool
+	leading   bool
+	shared    [][]string
 	// hook, if set, is called before each replica operation (tests inject faults with it).
 	hook func(replica string, op string) error
 }
@@ -674,6 +676,43 @@ type Receipt struct {
 	Replicas int    `json:"replicas"`
 }
 
+// AppendLater stores an entry without waiting: it goes into the next batch that is written
+// (or, if none comes, within lazyEvery). Used for records nothing waits on (how a change
+// that is already in the vault ended); Flush writes what is pending.
+func (v *Vault) AppendLater(e Entry) {
+	batch := rnd() + rnd()
+	recs, err := v.split(e, batch, float64(v.o.Now().UnixNano())/1e9)
+	if err != nil {
+		return
+	}
+	v.qmu.Lock()
+	v.lazy = append(v.lazy, &waiter{recs: recs, done: make(chan struct{})})
+	start := !v.lazyTimer
+	v.lazyTimer = true
+	v.qmu.Unlock()
+	if start {
+		time.AfterFunc(lazyEvery, func() { _ = v.Flush() })
+	}
+}
+
+// lazyEvery: the longest an AppendLater entry waits for a batch to ride in.
+var lazyEvery = 200 * time.Millisecond
+
+// Flush writes every entry AppendLater queued.
+func (v *Vault) Flush() error {
+	v.qmu.Lock()
+	v.lazyTimer = false
+	if len(v.lazy) == 0 {
+		v.qmu.Unlock()
+		return nil
+	}
+	last := v.lazy[len(v.lazy)-1]
+	v.qmu.Unlock()
+	v.lead()
+	<-last.done
+	return last.err
+}
+
 // Append stores an entry on at least WriteQuorum replicas, or returns an error wrapping
 // ErrNoQuorum (some replicas may then hold it: such records are harmless and are kept).
 //
@@ -693,21 +732,30 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 	w := &waiter{recs: recs, done: make(chan struct{})}
 	v.qmu.Lock()
 	v.queue = append(v.queue, w)
+	v.qmu.Unlock()
+	v.lead()
+	<-w.done
+	return w.rc, w.err
+}
+
+// lead writes queued entries, batch after batch, unless another caller already is (then
+// that one writes them).
+func (v *Vault) lead() {
+	v.qmu.Lock()
 	if v.leading {
 		v.qmu.Unlock()
-		<-w.done
-		return w.rc, w.err
+		return
 	}
 	v.leading = true
 	v.qmu.Unlock()
 	for {
 		v.qmu.Lock()
-		group := v.queue
-		v.queue = nil
+		group := append(v.lazy, v.queue...) // queued later entries ride along
+		v.lazy, v.queue = nil, nil
 		if len(group) == 0 {
 			v.leading = false
 			v.qmu.Unlock()
-			break
+			return
 		}
 		v.qmu.Unlock()
 		v.appendGroup(group)
@@ -715,8 +763,6 @@ func (v *Vault) Append(e Entry) (*Receipt, error) {
 			close(g.done)
 		}
 	}
-	<-w.done
-	return w.rc, w.err
 }
 
 type waiter struct {
@@ -928,13 +974,9 @@ func (v *Vault) writeReplica(r string, t tail, recs []*Record) error {
 			return err
 		}
 	}
-	ix := make([]idxLine, len(recs))
-	off := base
-	for i, rec := range recs {
-		ix[i] = idxLine{Tx: rec.Tx, Seq: rec.Seq, Seg: filepath.Base(p), Off: off, Len: lens[i] - 1}
-		off += lens[i]
-	}
-	_ = writeIndex(r, ix, false)
+	_ = base
+	// the index is not written per append: every indexEvery records, and before a lookup,
+	// what is past its mark is indexed from the segments (in one pass, durably)
 	if recs[len(recs)-1].Seq/indexEvery != (recs[0].Seq-1)/indexEvery {
 		// every 1024 records: index everything past the mark again from the segments (lines
 		// a crash lost come back), sync, and move the mark

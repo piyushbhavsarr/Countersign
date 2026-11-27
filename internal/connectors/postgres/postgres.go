@@ -423,6 +423,8 @@ type UndoRecord struct {
 
 type Connector struct {
 	tx.Base
+	// Hide: not offered to agents as tools (a gateway's: only undo and restore use it).
+	Hide            bool
 	DSN             string
 	Env             string
 	FractionMinRows int64
@@ -1040,6 +1042,53 @@ func (c *Connector) Preview(t *tx.Tx) map[string]any {
 	return map[string]any{"database": redact(c.DSN), "env": c.Env, "statements": stmts}
 }
 
+// Hidden: see tx.Hidden.
+func (c *Connector) Hidden() bool { return c.Hide }
+
+// RecordDSN is the database name written into undo records made for this connector by
+// others (the gateway): the DSN without its password, which stays in the configuration.
+func (c *Connector) RecordDSN() string { return redact(c.DSN) }
+
+// dsnOf: the DSN to connect with for a recorded one (the password comes from here).
+func (c *Connector) dsnOf(recorded string) string {
+	if recorded == redact(c.DSN) {
+		return c.DSN
+	}
+	return recorded
+}
+
+// sameDB: a record names this connector's database.
+func (c *Connector) sameDB(recorded string) bool {
+	return recorded == c.DSN || recorded == redact(c.DSN)
+}
+
+// ResolveInFlight tells, for a record whose commit may not have happened (written before
+// COMMIT, by the gateway), whether the server committed it: from txid_status.
+func (c *Connector) ResolveInFlight(raw json.RawMessage) (committed, known bool, err error) {
+	var rec UndoRecord
+	if err := json.Unmarshal(raw, &rec); err != nil || rec.XID == 0 {
+		return false, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, c.dsnOf(rec.DSN))
+	if err != nil {
+		return false, false, err
+	}
+	defer conn.Close(ctx)
+	var status *string
+	if err := conn.QueryRow(ctx, "SELECT txid_status($1)", rec.XID).Scan(&status); err != nil {
+		return false, false, err
+	}
+	if status == nil || *status == "in progress" {
+		return false, false, nil
+	}
+	return *status == "committed", true, nil
+}
+
+// KeyOf is a row's primary key, as captured (exported for the gateway).
+func KeyOf(row string, pk []string) string { return keyOf(row, pk) }
+
 func redact(dsn string) string {
 	if i := strings.Index(dsn, "://"); i >= 0 {
 		if j := strings.Index(dsn[i+3:], "@"); j >= 0 {
@@ -1140,7 +1189,7 @@ func (c *Connector) UndoInFlight(raw json.RawMessage) error {
 		return nil
 	}
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, rec.DSN)
+	conn, err := pgx.Connect(ctx, c.dsnOf(rec.DSN))
 	if err != nil {
 		return err
 	}
@@ -1183,7 +1232,7 @@ func (c *Connector) Undo(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &rec); err != nil {
 		return err
 	}
-	l, err := open(rec.DSN, "undo", true)
+	l, err := open(c.dsnOf(rec.DSN), "undo", true)
 	if err != nil {
 		return err
 	}

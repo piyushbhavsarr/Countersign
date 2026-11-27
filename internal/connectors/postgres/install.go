@@ -28,6 +28,13 @@ BEGIN
   RETURN NULL;
 END $$;
 
+-- refuse: how the gateway refuses a statement. The server itself raises the error, so the
+-- transaction it is in fails exactly as it would for any other error.
+CREATE OR REPLACE FUNCTION undolayer.refuse(msg text, code text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION USING MESSAGE = msg, ERRCODE = code;
+END $$;
+
 CREATE OR REPLACE FUNCTION undolayer.attach(rel regclass) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = rel AND tgname = 'undolayer_capture') THEN

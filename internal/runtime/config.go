@@ -37,6 +37,7 @@ import (
 	"undolayer/internal/connectors/sqlite"
 	"undolayer/internal/connectors/workspace"
 	"undolayer/internal/creds"
+	"undolayer/internal/gateway/pggw"
 	"undolayer/internal/policy"
 	"undolayer/internal/registry"
 	"undolayer/internal/review"
@@ -81,6 +82,9 @@ type Config struct {
 	Credentials map[string]creds.Spec `toml:"credentials"`
 	// [[mcp_server]]: other MCP servers behind the gateway (command for stdio, or url).
 	MCPServers []mcpproxy.Server `toml:"mcp_server"`
+	// [[pg_gateway]]: Countersign in front of a PostgreSQL database, speaking its protocol
+	// (served by undolayer gateway). Its transactions can be undone and restored like any.
+	PGGateways []pggw.Route `toml:"pg_gateway"`
 	HTTP       struct {
 		AllowHosts []string `toml:"allow_hosts"`
 		// AllowPrivateHosts: hosts (globs) http.request may reach on loopback or private
@@ -487,6 +491,12 @@ registry:
 			kc.Namespace = k.Namespace
 		}
 		m.Register(kc)
+	}
+	for _, r := range c.PGGateways {
+		// the connector undo and restore use for this gateway's transactions (not a tool)
+		pc := postgres.New(r.Primary)
+		pc.ConnName, pc.Hide = "gw-"+r.Name, true
+		m.Register(pc)
 	}
 	for _, sv := range c.MCPServers {
 		if _, err := m.Connector(sv.Name); err == nil {

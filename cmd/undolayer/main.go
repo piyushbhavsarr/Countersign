@@ -15,6 +15,7 @@
 //	undolayer vault check | repair | keys | rotate-key | shred-key <id>
 //	undolayer freeze <requester> [--reason TEXT] | unfreeze <requester> | frozen
 //	undolayer mcp list | pin <server>
+//	undolayer gateway -c undolayer.toml          serve every [[pg_gateway]] (PostgreSQL protocol)
 //	undolayer bench [--json] [--suite core|heldout|all] [--policy none] [--no-sandbox]
 package main
 
@@ -193,6 +194,11 @@ func main() {
 		parseArgs(fs, args)
 		_, m := load(*cfgPath)
 		mcpCmd(m, fs.Args())
+		return
+	case "gateway":
+		parseArgs(fs, args)
+		c, m := load(*cfgPath)
+		gatewayCmd(c, m)
 		return
 	case "freeze", "unfreeze", "frozen":
 		parseArgs(fs, args)
@@ -442,6 +448,15 @@ func manage(cmd, cfgPath string, fs *flag.FlagSet) {
 		die(fmt.Errorf("usage: undolayer %s <tx>", cmd))
 	}
 	t, err := m.Get(fs.Arg(0))
+	if err != nil && cmd == "undo" && m.Vault != nil {
+		// a task known only from the vault (a gateway transaction)
+		r, verr := m.UndoFromVault(fs.Arg(0))
+		if verr != nil {
+			die(fmt.Errorf("%v (and from the vault: %v)", err, verr))
+		}
+		out(r)
+		return
+	}
 	if err != nil {
 		die(err)
 	}

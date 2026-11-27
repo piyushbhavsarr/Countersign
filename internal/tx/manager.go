@@ -115,6 +115,9 @@ func (m *Manager) note(event string, data map[string]any) {
 // (call before the process exits).
 func (m *Manager) Flush() error {
 	m.later.Wait()
+	if m.Vault != nil {
+		_ = m.Vault.Flush()
+	}
 	return m.Audit.Flush()
 }
 

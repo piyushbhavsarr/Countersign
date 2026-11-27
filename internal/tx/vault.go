@@ -3,6 +3,7 @@ package tx
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
@@ -97,6 +98,7 @@ type ChangedRows struct {
 	// be opened for another reason.
 	Shredded bool            `json:"shredded,omitempty"`
 	Error    string          `json:"error,omitempty"`
+	Batch    string          `json:"-"` // the vault intent it comes from
 	Rows     []vault.Row     `json:"rows"`
 	Record   json.RawMessage `json:"-"`
 }
@@ -177,8 +179,14 @@ func (m *Manager) ChangedRows(id string) ([]ChangedRows, error) {
 		byBatch[b.Batch] = b
 	}
 	settled := map[string]string{}
+	undone := map[string]bool{}
 	for _, b := range bs {
-		if b.Ref != "" {
+		if b.Ref == "" {
+			continue
+		}
+		if b.Phase == "undone" {
+			undone[b.Ref] = true
+		} else {
 			settled[b.Ref] = b.Phase
 		}
 	}
@@ -192,7 +200,17 @@ func (m *Manager) ChangedRows(id string) ([]ChangedRows, error) {
 		}
 		cr := ChangedRows{Tx: id, Connector: b.Connector, State: state, Source: "vault", Rows: b.Rows, Record: b.Undo,
 			Shredded: b.Shredded, Error: b.Error}
-		cr.Settled = settled[b.Batch]
+		cr.Settled, cr.Undone, cr.Batch = settled[b.Batch], undone[b.Batch], b.Batch
+		if cr.Settled == "" && len(cr.Record) > 0 {
+			// written before a commit whose outcome was not recorded: the system itself says
+			if c, err := m.Connector(b.Connector); err == nil {
+				if r, ok := c.(InFlightResolver); ok {
+					if committed, known, err := r.ResolveInFlight(cr.Record); err == nil && known {
+						cr.Settled = map[bool]string{true: "committed", false: "failed"}[committed]
+					}
+				}
+			}
+		}
 		switch settled[b.Batch] {
 		case "committed":
 			for _, c := range bs {
@@ -273,4 +291,63 @@ func (m *Manager) vaultLater(fn func()) {
 		defer m.later.Done()
 		fn()
 	}()
+}
+
+// InFlightResolver tells whether a record written before a commit (by the gateway, which
+// relays an application's own COMMIT) was committed by the system it describes.
+type InFlightResolver interface {
+	ResolveInFlight(record json.RawMessage) (committed, known bool, err error)
+}
+
+// Hidden connectors are not offered to agents as tools (the gateway's, which exist so
+// that undo and restore can reach what the gateway recorded).
+type Hidden interface{ Hidden() bool }
+
+// UndoFromVault undoes a task known only from the vault (a gateway transaction): each
+// committed change is put back with its connector's undo, which refuses if what it would
+// restore changed since; then the vault records that it was undone.
+func (m *Manager) UndoFromVault(id string) (*UndoReport, error) {
+	if m.Vault == nil {
+		return nil, fmt.Errorf("%s: no journal, and the vault is disabled", id)
+	}
+	crs, err := m.ChangedRows(id)
+	if err != nil {
+		return nil, err
+	}
+	rep := &UndoReport{Tx: id, Undone: []string{}, Compensated: []string{}, Cancelled: []string{},
+		Conflicts: []map[string]any{}, Expired: []map[string]any{}, FailedParts: []map[string]any{},
+		NotUndoable: []map[string]any{}, Warnings: []string{}}
+	n := 0
+	for i := len(crs) - 1; i >= 0; i-- {
+		cr := crs[i]
+		if cr.Source != "vault" || cr.Undone || len(cr.Record) == 0 || cr.Settled == "failed" {
+			continue // already undone, or it never happened
+		}
+		n++
+		c, err := m.Connector(cr.Connector)
+		if err == nil {
+			err = c.Undo(cr.Record)
+		}
+		var cc *model.CommitConflict
+		switch {
+		case err == nil:
+			rep.Undone = append(rep.Undone, cr.Connector)
+			if _, verr := m.Vault.Append(vault.Entry{Tx: id, Connector: cr.Connector, Phase: "undone", Ref: cr.Batch}); verr != nil {
+				rep.Warnings = append(rep.Warnings, "undone, but the vault could not record it: "+verr.Error())
+			}
+		case errors.As(err, &cc):
+			rep.Conflicts = append(rep.Conflicts, map[string]any{"connector": cr.Connector, "reason": err.Error()})
+		default:
+			rep.FailedParts = append(rep.FailedParts, map[string]any{"connector": cr.Connector, "reason": err.Error()})
+		}
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%s: nothing in the vault left to undo", id)
+	}
+	rep.State = model.Undone
+	if !rep.Clean() {
+		rep.State = model.Failed
+	}
+	m.audit("undo", map[string]any{"tx": id, "from": "vault", "clean": rep.Clean()})
+	return rep, nil
 }
